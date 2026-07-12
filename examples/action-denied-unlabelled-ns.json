@@ -1,0 +1,14 @@
+{
+  "action_type": "inject_fault",
+  "target_id": "kind-local",
+  "environment": "dev",
+  "namespace": "default",
+  "namespace_chaos_enabled": false,
+  "fault": {
+    "fault_type": "pod_kill",
+    "selector": {"app": "cartservice"},
+    "ratio": 0.34,
+    "duration_seconds": 60
+  },
+  "ttl_seconds": 300
+}

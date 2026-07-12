@@ -1,0 +1,10 @@
+{
+  "id": "kind-local",
+  "name": "Local kind rig",
+  "kind": "kubernetes",
+  "environment": "dev",
+  "provider": "kind",
+  "allowed_namespaces": ["boutique"],
+  "labels": {"team": "platform", "rig": "local"},
+  "credential": {"service_account": "agent-experimenter"}
+}

@@ -1,0 +1,16 @@
+{
+  "action_type": "inject_fault",
+  "target_id": "kind-local",
+  "environment": "dev",
+  "namespace": "boutique",
+  "namespace_chaos_enabled": true,
+  "fault": {
+    "fault_type": "pod_kill",
+    "selector": {"app": "cartservice"},
+    "ratio": 0.34,
+    "duration_seconds": 60
+  },
+  "ttl_seconds": 300,
+  "incident_active": false,
+  "concurrent_experiments": 0
+}
