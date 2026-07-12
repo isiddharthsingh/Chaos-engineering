@@ -1,0 +1,85 @@
+# Kyverno ClusterPolicy — admission-side twin of the engine's `replica-cap` rule.
+# A single agent-driven scale must not move a workload's replicas by more than
+# max_replica_pct_change (0.5). Applies in namespaces the agent can write to
+# (labelled chaos-enabled=true); other namespaces are out of the agent's scope.
+#
+# Matches BOTH the scale subresource (kubectl scale / HPA / the resources_scale
+# MCP tool all go through /scale) AND direct edits to the parent's spec.replicas.
+# On the scale subresource, request.object is a Scale whose spec.replicas is the
+# same JMESPath, so one rule covers both.
+#
+# NOTE: keep the 0.5 threshold in sync with config/policies/engine.yaml.
+# tests/test_manifests.py::test_replica_cap_matches_engine_config fails the build
+# if this value drifts from the engine's max_replica_pct_change.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cap-replica-change
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Cap replica changes on Deployments/StatefulSets at +/-50%. Mirrors
+      chaosagent.policy rule id 'replica-cap'.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: bound-replica-percentage
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - Deployment/scale
+                - StatefulSet/scale
+              operations: ["UPDATE"]
+              namespaceSelector:
+                matchLabels:
+                  chaos-enabled: "true"
+      # Only evaluate the ratio when the workload was running (>0 replicas);
+      # scaling from zero is handled by the separate rule below.
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.replicas || `0` }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          [replica-cap] replica change from {{ request.oldObject.spec.replicas }}
+          to {{ request.object.spec.replicas }} exceeds the +/-50% cap.
+        deny:
+          conditions:
+            any:
+              - key: >-
+                  {{ divide(abs(subtract(request.object.spec.replicas,
+                  request.oldObject.spec.replicas)), request.oldObject.spec.replicas) }}
+                operator: GreaterThan
+                value: 0.5
+    - name: deny-unbounded-scale-from-zero
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - Deployment/scale
+                - StatefulSet/scale
+              operations: ["UPDATE"]
+              namespaceSelector:
+                matchLabels:
+                  chaos-enabled: "true"
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.replicas || `0` }}"
+            operator: Equals
+            value: 0
+          - key: "{{ request.object.spec.replicas || `0` }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          [replica-cap] scaling from 0 replicas is unbounded and refused; a human
+          must wake a scaled-to-zero workload.
+        deny: {}

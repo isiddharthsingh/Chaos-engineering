@@ -1,0 +1,48 @@
+# Observer tier: strictly read-only, cluster-wide.
+#
+# Observation needs to see the whole cluster (nodes, all workloads, events,
+# metrics, and the state of any running chaos/experiment CRs) but must never
+# mutate anything. verbs are limited to get/list/watch with no exceptions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chaos-agent-observer
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+    chaosagent.dev/capability-tier: observer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "nodes", "events", "endpoints", "namespaces",
+                "persistentvolumeclaims", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  # Read the state of chaos experiments and their results, but never create them.
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["litmuschaos.io"]
+    resources: ["chaosengines", "chaosexperiments", "chaosresults"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chaos-agent-observer
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chaos-agent-observer
+subjects:
+  - kind: ServiceAccount
+    name: agent-observer
+    namespace: chaos-agent-system

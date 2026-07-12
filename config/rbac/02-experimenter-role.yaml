@@ -1,0 +1,59 @@
+# Experimenter tier: write access, but NAMESPACE-SCOPED by construction.
+#
+# This is a namespaced Role plus a RoleBinding. The binding lives in the target
+# namespace and references the agent-experimenter SA from chaos-agent-system.
+# Because it is a Role (never a ClusterRole binding), the experimenter can only
+# act in namespaces where this manifest has been applied. Applying it ONLY to
+# namespaces labelled chaos-enabled=true is the RBAC half of the namespace gate;
+# the Kyverno policy (config/policies/kyverno) is the admission half.
+#
+# Templated on the namespace. scripts/apply-experimenter.sh renders one copy per
+# chaos-enabled namespace. Here the concrete example targets `boutique`, the
+# demo app namespace used by the local kind rig.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chaos-agent-experimenter
+  namespace: boutique
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+    chaosagent.dev/capability-tier: experimenter
+rules:
+  # Create / inspect / clean up Chaos Mesh faults in THIS namespace only.
+  - apiGroups: ["chaos-mesh.org"]
+    resources: ["podchaos", "networkchaos", "stresschaos", "iochaos", "dnschaos",
+                "httpchaos", "timechaos", "schedules", "workflows"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # NOTE: LitmusChaos write access is intentionally NOT granted here. There is no
+  # admission-side chaos-enabled=true gate for litmuschaos.io ChaosEngine yet
+  # (Chaos Mesh is the Phase 0/1 engine); granting create without that gate would
+  # let a Litmus fault into a non-opted-in namespace. Re-add alongside a Litmus
+  # namespace policy in Phase 2.
+  # Capacity actions: adjust replicas via the scale subresource. No delete on
+  # workloads — the agent scales, it does not remove deployments.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  # k6 distributed load runs (Phase 2), scoped the same way.
+  - apiGroups: ["k6.io"]
+    resources: ["testruns"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chaos-agent-experimenter
+  namespace: boutique
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: chaos-agent-experimenter
+subjects:
+  - kind: ServiceAccount
+    name: agent-experimenter
+    namespace: chaos-agent-system

@@ -1,0 +1,50 @@
+# Kyverno ClusterPolicy — the admission-side twin of the engine's
+# `require-chaos-namespace` rule. Even if the agent's pre-flight check were
+# bypassed, the cluster itself refuses to admit a chaos CR into a namespace that
+# has not opted in with the label chaos-enabled=true.
+#
+# Tested against Kyverno 1.12+. `validationFailureAction: Enforce` blocks the
+# request (vs. Audit, which only reports).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-chaos-namespace
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Deny any chaos experiment resource in a namespace not labelled
+      chaos-enabled=true. Mirrors chaosagent.policy rule id 'require-chaos-namespace'.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: chaos-only-in-labelled-namespace
+      match:
+        any:
+          - resources:
+              # Chaos Mesh kinds only. Kyverno rejects a policy that names a kind
+              # whose CRD is absent, so the LitmusChaos ChaosEngine gate lives in
+              # a separate policy applied alongside Litmus (Phase 2).
+              kinds:
+                - PodChaos
+                - NetworkChaos
+                - StressChaos
+                - IOChaos
+                - DNSChaos
+                - HTTPChaos
+                - TimeChaos
+      context:
+        - name: ns
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}"
+      validate:
+        message: >-
+          [require-chaos-namespace] namespace '{{ request.namespace }}' is not
+          labelled chaos-enabled=true; fault injection refused.
+        deny:
+          conditions:
+            any:
+              - key: '{{ ns.metadata.labels."chaos-enabled" || '''' }}'
+                operator: NotEquals
+                value: "true"

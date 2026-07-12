@@ -1,0 +1,67 @@
+# Kyverno ClusterPolicy — admission-side twin of the engine's duration/TTL rules.
+# Every Chaos Mesh experiment must declare spec.duration (so it self-reverts on a
+# bounded timer) AND that duration must sit under the self-revert ceiling the
+# pre-flight engine enforces (max_fault_duration_seconds = 900s). A present-but-
+# huge duration like "24h" would otherwise be admitted and run far past the
+# backstop — this denies both the missing and the over-long cases.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-experiment-ttl
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Require spec.duration on all Chaos Mesh experiments and cap it at 900s.
+      Mirrors chaosagent.policy rules 'require-ttl' and 'fault-duration-cap'.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: chaos-must-declare-duration
+      match:
+        any:
+          - resources:
+              kinds:
+                - PodChaos
+                - NetworkChaos
+                - StressChaos
+                - IOChaos
+                - DNSChaos
+                - HTTPChaos
+                - TimeChaos
+      validate:
+        message: >-
+          [require-ttl] every chaos experiment must set spec.duration so it
+          self-reverts on a bounded timer.
+        pattern:
+          spec:
+            duration: "?*"
+    - name: chaos-duration-under-ceiling
+      match:
+        any:
+          - resources:
+              kinds:
+                - PodChaos
+                - NetworkChaos
+                - StressChaos
+                - IOChaos
+                - DNSChaos
+                - HTTPChaos
+                - TimeChaos
+      # Only evaluate the ceiling when a duration is present; absence is caught
+      # by the rule above.
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.duration || '' }}"
+            operator: NotEquals
+            value: ""
+      validate:
+        message: >-
+          [fault-duration-cap] spec.duration exceeds the 900s self-revert ceiling.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.duration }}"
+                operator: DurationGreaterThan
+                value: "900s"

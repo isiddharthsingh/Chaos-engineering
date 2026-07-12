@@ -1,0 +1,75 @@
+# Kyverno ClusterPolicy — admission-side twin of the engine's `fault-blast-radius`
+# rule. A single fault may not exceed max_fault_ratio (0.5) of the matched pods.
+#
+# Chaos Mesh expresses blast radius via spec.mode + spec.value:
+#   * mode: all                 -> 100% of matched pods (always denied)
+#   * mode: fixed-percent       -> spec.value percent (capped at 50)
+#   * mode: random-max-percent  -> up to spec.value percent (capped at 50)
+#   * mode: one / fixed         -> absolute counts, left to the pre-flight engine
+# This mirrors the 0.5 fraction for the percentage-based modes and hard-denies
+# `all`, so even a hand-applied CR cannot take out a whole service tier.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cap-blast-radius
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Cap chaos blast radius at 50% of matched pods. Mirrors chaosagent.policy
+      rule id 'fault-blast-radius'.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: deny-mode-all
+      match:
+        any:
+          - resources:
+              kinds:
+                - PodChaos
+                - NetworkChaos
+                - StressChaos
+                - IOChaos
+                - DNSChaos
+                - HTTPChaos
+                - TimeChaos
+      validate:
+        message: >-
+          [fault-blast-radius] mode 'all' affects 100% of matched pods; the cap
+          is 50%. Use fixed-percent/random-max-percent with value <= 50.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.mode }}"
+                operator: Equals
+                value: all
+    - name: cap-percent-modes
+      match:
+        any:
+          - resources:
+              kinds:
+                - PodChaos
+                - NetworkChaos
+                - StressChaos
+                - IOChaos
+                - DNSChaos
+                - HTTPChaos
+                - TimeChaos
+      preconditions:
+        any:
+          - key: "{{ request.object.spec.mode }}"
+            operator: Equals
+            value: fixed-percent
+          - key: "{{ request.object.spec.mode }}"
+            operator: Equals
+            value: random-max-percent
+      validate:
+        message: >-
+          [fault-blast-radius] spec.value exceeds the 50% blast-radius cap.
+        deny:
+          conditions:
+            any:
+              - key: "{{ to_number(request.object.spec.value || '0') }}"
+                operator: GreaterThan
+                value: 50
