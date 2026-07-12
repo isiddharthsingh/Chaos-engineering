@@ -1,0 +1,26 @@
+# Policy caps — the single source of truth for the guardrail spine.
+#
+# The Python pre-flight engine (chaosagent.policy) loads this directly. The
+# Kyverno bundle (config/policies/kyverno/) is rendered from these same numbers
+# by scripts/render_kyverno.py so the in-cluster and pre-flight layers agree.
+#
+# Tighten, never loosen, without a review: every value here bounds blast radius
+# for fully autonomous runs on dev/staging.
+
+# Max absolute fractional replica change a capacity action may request (+/-50%).
+max_replica_pct_change: 0.5
+
+# Longest lifetime any single fault/experiment may declare (1h).
+max_ttl_seconds: 3600
+
+# A fault must self-revert within this window (15m) — runaway-CR backstop.
+max_fault_duration_seconds: 900
+
+# Largest blast-radius fraction a single fault may target (50% of matched pods).
+max_fault_ratio: 0.5
+
+# One experiment at a time per target.
+max_concurrent_experiments: 1
+
+# NOTE: the prod freeze is unconditional in the engine (not a config knob), so a
+# policy file cannot disable the "no state change against prod" invariant.
