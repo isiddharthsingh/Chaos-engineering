@@ -78,4 +78,6 @@ defensible, against the **shipped** policy config:
 - Phases 2–4: fault library + k6 load + cloud K8s; capacity planning; multi-cloud
   + VMs + Temporal durability + prod escalation.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full design.
+See [`docs/architecture.md`](docs/architecture.md) for the full design and
+[`docs/roadmap.md`](docs/roadmap.md) for the Phase 1 & 2 build plan (components
+mapped to files, verification, and definition of done).
