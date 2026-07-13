@@ -66,25 +66,38 @@ class FakeExecutor:
         *,
         clock: FakeClock | None = None,
         deny_dry_run: str | None = None,
+        deny_dry_run_kind: str | None = None,
         deny_apply: str | None = None,
+        deny_apply_kind: str | None = None,
+        fail_delete: str | None = None,
     ) -> None:
         self.journal: Journal = journal if journal is not None else []
         self._clock = clock
         self._deny_dry_run = deny_dry_run
+        #: When set, deny_dry_run only fires for CRs of this kind.
+        self._deny_dry_run_kind = deny_dry_run_kind
         self._deny_apply = deny_apply
+        #: When set, deny_apply only fires for CRs of this kind (e.g. "TestRun").
+        self._deny_apply_kind = deny_apply_kind
+        #: When set, every delete raises RuntimeError with this message.
+        self._fail_delete = fail_delete
         self.dry_runs: list[dict[str, Any]] = []
         self.applied: list[AppliedExperiment] = []
         self.deleted: list[AppliedExperiment] = []
 
     def dry_run(self, cr: dict[str, Any], binding: object) -> None:
         self.journal.append("dry_run")
-        if self._deny_dry_run is not None:
+        if self._deny_dry_run is not None and (
+            self._deny_dry_run_kind is None or cr["kind"] == self._deny_dry_run_kind
+        ):
             raise ExecutionDenied(self._deny_dry_run)
         self.dry_runs.append(cr)
 
     def apply(self, cr: dict[str, Any], binding: object) -> AppliedExperiment:
         self.journal.append("apply")
-        if self._deny_apply is not None:
+        if self._deny_apply is not None and (
+            self._deny_apply_kind is None or cr["kind"] == self._deny_apply_kind
+        ):
             raise ExecutionDenied(self._deny_apply)
         applied = AppliedExperiment(
             kind=cr["kind"],
@@ -97,6 +110,8 @@ class FakeExecutor:
 
     def delete(self, applied: AppliedExperiment) -> None:
         self.journal.append("delete")
+        if self._fail_delete is not None:
+            raise RuntimeError(self._fail_delete)
         self.deleted.append(applied)
 
 
@@ -111,12 +126,20 @@ class FakeApiException(Exception):
 
 
 class FakeCustomObjectsApi:
-    """Records custom-object calls; create failures are scripted."""
+    """Records custom-object calls; create failures are scripted. Plurals in
+    ``absent_plurals`` behave like an uninstalled CRD (every call 404s)."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
+        #: The API group of each call, in the same order as ``calls``.
+        self.groups: list[str] = []
         self.create_error: Exception | None = None
+        self.absent_plurals: set[str] = set()
         self._objects: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def _check_crd(self, plural: str) -> None:
+        if plural in self.absent_plurals:
+            raise FakeApiException(404, reason="the server could not find the requested resource")
 
     def create_namespaced_custom_object(
         self,
@@ -130,6 +153,8 @@ class FakeCustomObjectsApi:
     ) -> dict[str, Any]:
         name = body["metadata"]["name"]
         self.calls.append(("create", namespace, plural, name, dry_run or ""))
+        self.groups.append(group)
+        self._check_crd(plural)
         if self.create_error is not None:
             raise self.create_error
         if dry_run is None:
@@ -140,6 +165,8 @@ class FakeCustomObjectsApi:
         self, group: str, version: str, namespace: str, plural: str, name: str
     ) -> dict[str, Any]:
         self.calls.append(("delete", namespace, plural, name))
+        self.groups.append(group)
+        self._check_crd(plural)
         if (namespace, plural, name) not in self._objects:
             raise FakeApiException(404, reason="Not Found")
         del self._objects[(namespace, plural, name)]
@@ -155,6 +182,8 @@ class FakeCustomObjectsApi:
         label_selector: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(("list", namespace, plural, label_selector or ""))
+        self.groups.append(group)
+        self._check_crd(plural)
         items = [
             body
             for (ns, plu, _), body in self._objects.items()

@@ -21,10 +21,30 @@ from chaosagent.faults.chaosmesh import MANAGED_BY_LABEL, MANAGED_BY_VALUE
 
 GROUP = "chaos-mesh.org"
 VERSION = "v1alpha1"
+#: k6-operator load CRs live in their own API group.
+K6_GROUP = "k6.io"
+K6_VERSION = "v1alpha1"
 
-#: CR kinds this executor may touch, and their API plurals. Phase 2 widens this
-#: alongside the composer.
-PLURALS: dict[str, str] = {"PodChaos": "podchaos"}
+#: CR kinds this executor may touch, and their API plurals — kept in lockstep
+#: with the composer dispatcher so every kind it emits is deletable.
+PLURALS: dict[str, str] = {
+    "PodChaos": "podchaos",
+    "NetworkChaos": "networkchaos",
+    "StressChaos": "stresschaos",
+    "IOChaos": "iochaos",
+    "DNSChaos": "dnschaos",
+    "TimeChaos": "timechaos",
+}
+K6_PLURALS: dict[str, str] = {"TestRun": "testruns"}
+
+
+def _route(kind: str) -> tuple[str, str, str] | None:
+    """kind -> (group, version, plural) across every API family we may touch."""
+    if kind in PLURALS:
+        return GROUP, VERSION, PLURALS[kind]
+    if kind in K6_PLURALS:
+        return K6_GROUP, K6_VERSION, K6_PLURALS[kind]
+    return None
 
 #: The namespaced write identity; impersonating it makes the tiered RBAC apply
 #: for real (same mechanism as `kubectl --as` in scripts/verify-guardrails.sh).
@@ -110,15 +130,15 @@ class ChaosMeshExecutor:
 
     def dry_run(self, cr: dict[str, Any], binding: ActionBinding) -> None:
         """Run the full admission chain server-side without persisting the CR."""
-        namespace, plural = self._admit(cr, binding)
-        self._create(cr, namespace, plural, dry_run=True)
+        namespace, route = self._admit(cr, binding)
+        self._create(cr, namespace, route, dry_run=True)
 
     def apply(self, cr: dict[str, Any], binding: ActionBinding) -> AppliedExperiment:
         """Gate -> shape checks -> server-side dry-run -> real create. Each step
         is fatal: nothing is created unless every layer said yes."""
-        namespace, plural = self._admit(cr, binding)
-        self._create(cr, namespace, plural, dry_run=True)
-        self._create(cr, namespace, plural, dry_run=False)
+        namespace, route = self._admit(cr, binding)
+        self._create(cr, namespace, route, dry_run=True)
+        self._create(cr, namespace, route, dry_run=False)
         return AppliedExperiment(
             kind=str(cr["kind"]),
             name=str(cr["metadata"]["name"]),
@@ -129,10 +149,13 @@ class ChaosMeshExecutor:
     def delete(self, applied: AppliedExperiment) -> None:
         """Delete the CR. Never gated, idempotent (404 is swallowed) — this is
         the abort path and must always be able to move toward safety."""
-        plural = PLURALS[applied.kind]
+        route = _route(applied.kind)
+        if route is None:
+            raise KeyError(applied.kind)
+        group, version, plural = route
         try:
             self._api.delete_namespaced_custom_object(
-                GROUP, VERSION, applied.namespace, plural, applied.name
+                group, version, applied.namespace, plural, applied.name
             )
         except Exception as exc:
             if _api_status(exc) == 404:
@@ -140,18 +163,28 @@ class ChaosMeshExecutor:
             raise
 
     def count_running(self, namespace: str) -> int:
-        """How many chaosagent-managed experiments exist in the namespace —
-        the probe behind the ``single-experiment`` policy rule."""
+        """How many chaosagent-managed resources exist in the namespace —
+        the probe behind the ``single-experiment`` policy rule. A 404 means the
+        kind's CRD is not installed, i.e. zero such resources exist."""
         selector = f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"
+        routes = [(GROUP, VERSION, plural) for plural in PLURALS.values()]
+        routes += [(K6_GROUP, K6_VERSION, plural) for plural in K6_PLURALS.values()]
         total = 0
-        for plural in PLURALS.values():
-            listed = self._api.list_namespaced_custom_object(
-                GROUP, VERSION, namespace, plural, label_selector=selector
-            )
+        for group, version, plural in routes:
+            try:
+                listed = self._api.list_namespaced_custom_object(
+                    group, version, namespace, plural, label_selector=selector
+                )
+            except Exception as exc:
+                if _api_status(exc) == 404:
+                    continue
+                raise
             total += len(listed.get("items", []))
         return total
 
-    def _admit(self, cr: dict[str, Any], binding: ActionBinding) -> tuple[str, str]:
+    def _admit(
+        self, cr: dict[str, Any], binding: ActionBinding
+    ) -> tuple[str, tuple[str, str, str]]:
         metadata = cr.get("metadata") or {}
         namespace = metadata.get("namespace")
         result = self._gate.authorize_write(
@@ -160,26 +193,27 @@ class ChaosMeshExecutor:
         if not result.allowed:
             raise ExecutionDenied(result.reason)
         kind = cr.get("kind")
-        plural = PLURALS.get(str(kind))
-        if plural is None:
-            raise ExecutionDenied(f"CR kind {kind!r} is not executable in Phase 1")
+        route = _route(str(kind))
+        if route is None:
+            raise ExecutionDenied(f"CR kind {kind!r} is not executable")
         if namespace != binding.action.namespace:
             raise ExecutionDenied(
                 f"CR namespace {namespace!r} does not match the bound action's "
                 f"namespace {binding.action.namespace!r}"
             )
-        return str(namespace), plural
+        return str(namespace), route
 
     def _create(
-        self, cr: dict[str, Any], namespace: str, plural: str, *, dry_run: bool
+        self, cr: dict[str, Any], namespace: str, route: tuple[str, str, str], *, dry_run: bool
     ) -> None:
+        group, version, plural = route
         try:
             if dry_run:
                 self._api.create_namespaced_custom_object(
-                    GROUP, VERSION, namespace, plural, cr, dry_run="All"
+                    group, version, namespace, plural, cr, dry_run="All"
                 )
             else:
-                self._api.create_namespaced_custom_object(GROUP, VERSION, namespace, plural, cr)
+                self._api.create_namespaced_custom_object(group, version, namespace, plural, cr)
         except Exception as exc:
             if _api_status(exc) is None:
                 raise
@@ -225,3 +259,26 @@ def read_namespace_chaos_enabled(
     core = client.CoreV1Api(client.ApiClient(configuration))
     labels = core.read_namespace(namespace).metadata.labels or {}
     return bool(labels.get("chaos-enabled") == "true")
+
+
+def read_configmap_exists(
+    namespace: str, name: str, *, kubeconfig: str | None = None, context: str | None = None
+) -> bool:
+    """Whether a ConfigMap exists — the PREFLIGHT probe behind k6 load specs (a
+    TestRun referencing a missing script ConfigMap is admitted but never starts
+    any load). Read like the namespace probe: an observer concern, not
+    impersonated (the experimenter role deliberately cannot read ConfigMaps)."""
+    from kubernetes import client, config
+
+    configuration = client.Configuration()
+    config.load_kube_config(
+        config_file=kubeconfig, context=context, client_configuration=configuration
+    )
+    core = client.CoreV1Api(client.ApiClient(configuration))
+    try:
+        core.read_namespaced_config_map(name, namespace)
+    except Exception as exc:
+        if _api_status(exc) == 404:
+            return False
+        raise
+    return True

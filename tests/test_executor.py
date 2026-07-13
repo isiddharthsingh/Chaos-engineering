@@ -88,8 +88,8 @@ def test_cr_namespace_must_match_the_binding() -> None:
 def test_unknown_kind_is_refused() -> None:
     api, executor, binding = _rig()
     cr = _cr()
-    cr["kind"] = "NetworkChaos"
-    with pytest.raises(ExecutionDenied, match="NetworkChaos"):
+    cr["kind"] = "HTTPChaos"  # a real Chaos Mesh kind we deliberately don't map
+    with pytest.raises(ExecutionDenied, match="HTTPChaos"):
         executor.apply(cr, binding)
     assert api.calls == []
 
@@ -151,3 +151,30 @@ def test_module_imports_without_the_kubernetes_extra() -> None:
 
     assert callable(build_experimenter_api)
     assert callable(read_namespace_chaos_enabled)
+
+
+def test_testrun_routes_to_the_k6_api_group() -> None:
+    from chaosagent.load import LoadSpec, compose_testrun
+
+    api, executor, binding = _rig()
+    load = LoadSpec(script_configmap="checkout-load", duration_seconds=60, ttl_seconds=300)
+    cr = compose_testrun(load, namespace="boutique", name="load-probe")
+    applied = executor.apply(cr, binding)
+    assert api.calls[-2:] == [
+        ("create", "boutique", "testruns", "load-probe", "All"),
+        ("create", "boutique", "testruns", "load-probe", ""),
+    ]
+    assert api.groups[-2:] == ["k6.io", "k6.io"]
+    assert executor.count_running("boutique") == 1  # the TestRun is counted
+    executor.delete(applied)
+    assert api.calls[-1] == ("delete", "boutique", "testruns", "load-probe")
+    assert api.groups[-1] == "k6.io"
+
+
+def test_count_running_treats_absent_crds_as_zero() -> None:
+    # A rig without k6-operator (or Chaos Mesh) must not fail the pre-flight
+    # probe closed: an uninstalled CRD means zero such resources exist.
+    api, executor, binding = _rig()
+    api.absent_plurals.add("testruns")
+    executor.apply(_cr(), binding)
+    assert executor.count_running("boutique") == 1

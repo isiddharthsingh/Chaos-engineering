@@ -11,6 +11,7 @@ from chaosagent.execute.kubernetes import (
     ChaosMeshExecutor,
     ExecutionDenied,
     build_experimenter_api,
+    read_configmap_exists,
     read_namespace_chaos_enabled,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "ChaosMeshExecutor",
     "ExecutionDenied",
     "build_experimenter_api",
+    "read_configmap_exists",
     "read_namespace_chaos_enabled",
 ]
