@@ -43,8 +43,23 @@ both enforce these, so exceeding them only gets the plan denied:
   * fault.ratio <= 0.5 (blast radius: at most half the matched pods)
   * fault.duration_seconds <= 900 (the fault must self-revert within 15m)
   * ttl_seconds <= 3600 (bounded lifetime for the whole experiment)
-  * pod faults only in this phase: pod_kill, pod_failure, container_kill
   * the experiment lands ONLY in the namespace you are given
+
+Supported fault_type values and the parameter block each requires (set exactly
+the matching block; pod faults take none):
+  * pod_kill, pod_failure — no block
+  * container_kill — no block, but fault.container_names must name a container
+  * network_latency / network_loss / network_partition — block `network` with
+    action delay / loss / partition (delay requires latency_ms; loss requires
+    loss_percent; direction must stay "to" — target-side shaping is not
+    supported; container_names is not accepted for network faults)
+  * cpu_stress / memory_stress — block `stress` (cpu_stress requires
+    cpu_workers; memory_stress requires memory_workers)
+  * io_stress — block `io` with action latency or fault (volume_path is always
+    required; latency requires delay_ms, fault requires errno)
+  * dns_chaos — block `dns` (action error or random; at least one entry in
+    patterns)
+  * time_skew — block `time` (time_offset such as "-10m")
 
 Design guidance: pick a fault the workload should survive, and steady-state
 hypotheses as PromQL threshold checks (e.g. available replicas >= 1, error

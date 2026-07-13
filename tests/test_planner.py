@@ -77,13 +77,21 @@ def test_extract_with_only_invalid_specs_raises_with_the_validation_error() -> N
 
 
 def test_system_prompt_embeds_schema_and_caps() -> None:
-    # The schema, the numeric caps, and the pod-fault restriction all appear so
-    # the model plans inside the same bounds the engine enforces.
+    # The schema, the numeric caps, and the supported fault families all appear
+    # so the model plans inside the same bounds the engine enforces.
     assert "ExperimentSpec" in PLANNER_SYSTEM_PROMPT
     assert '"properties"' in PLANNER_SYSTEM_PROMPT
     for cap in ("0.5", "900", "3600"):
         assert cap in PLANNER_SYSTEM_PROMPT
-    assert "pod_kill" in PLANNER_SYSTEM_PROMPT
+    for family in (
+        "pod_kill",
+        "network_latency",
+        "cpu_stress",
+        "io_stress",
+        "dns_chaos",
+        "time_skew",
+    ):
+        assert family in PLANNER_SYSTEM_PROMPT
     assert "read-only" in PLANNER_SYSTEM_PROMPT.lower()
 
 

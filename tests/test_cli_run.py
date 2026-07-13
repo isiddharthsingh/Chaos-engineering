@@ -292,3 +292,14 @@ def test_example_spec_is_valid() -> None:
     assert spec.fault.ratio <= 0.5
     assert spec.fault.duration_seconds <= 900
     assert spec.ttl_seconds <= 3600
+
+
+def test_example_network_latency_spec_is_valid() -> None:
+    path = Path(__file__).resolve().parents[1] / "examples" / "experiment-network-latency.json"
+    spec = ExperimentSpec.model_validate_json(path.read_text())
+    assert spec.fault.fault_type.value == "network_latency"
+    assert spec.fault.network is not None and spec.fault.network.latency_ms
+    # The example must sit inside every policy cap.
+    assert spec.fault.ratio <= 0.5
+    assert spec.fault.duration_seconds <= 900
+    assert spec.ttl_seconds <= 3600

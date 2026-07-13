@@ -19,8 +19,8 @@ API_VERSION = "chaos-mesh.org/v1alpha1"
 MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
 MANAGED_BY_VALUE = "chaosagent"
 
-# FaultType -> PodChaos spec.action. Everything else is Phase 2 (NetworkChaos,
-# StressChaos, ...) and refused here so intent can never silently degrade.
+# FaultType -> PodChaos spec.action. Other families have their own composers
+# and are refused here so intent can never silently degrade.
 _POD_ACTIONS: dict[FaultType, str] = {
     FaultType.POD_KILL: "pod-kill",
     FaultType.POD_FAILURE: "pod-failure",
@@ -30,6 +30,48 @@ _POD_ACTIONS: dict[FaultType, str] = {
 
 class UnsupportedFaultError(ValueError):
     """Raised for fault types this composer cannot express yet."""
+
+
+def base_chaos_cr(
+    kind: str,
+    slug: str,
+    fault: FaultSpec,
+    *,
+    namespace: str,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Skeleton every Chaos Mesh composer builds on: bounded selector, the
+    Kyverno-compatible mode/value/duration triple, the managed-by label, and a
+    DNS-label name (``chaosagent-<slug>-<8hex>``).
+    """
+    if not fault.selector:
+        # An empty labelSelectors matches EVERY pod in the namespace, so the
+        # blast-radius cap would silently apply to unrelated workloads. Refuse.
+        raise ValueError(
+            f"fault selector is empty; a {kind} with no labelSelectors targets "
+            "every pod in the namespace. Provide a selector to bound the blast radius."
+        )
+    return {
+        "apiVersion": API_VERSION,
+        "kind": kind,
+        "metadata": {
+            "name": name or f"chaosagent-{slug}-{secrets.token_hex(4)}",
+            "namespace": namespace,
+            "labels": {MANAGED_BY_LABEL: MANAGED_BY_VALUE},
+        },
+        "spec": {
+            "mode": "fixed-percent",
+            # Floor at 1: a sub-1% ratio would round to "0", producing a fault that
+            # selects no pods yet still "succeeds" — a run that scores as resilient
+            # without any fault having occurred.
+            "value": str(max(1, round(fault.ratio * 100))),
+            "duration": f"{fault.duration_seconds}s",
+            "selector": {
+                "namespaces": [namespace],
+                "labelSelectors": dict(fault.selector),
+            },
+        },
+    }
 
 
 def compose_podchaos(
@@ -47,40 +89,12 @@ def compose_podchaos(
     action = _POD_ACTIONS.get(fault.fault_type)
     if action is None:
         raise UnsupportedFaultError(
-            f"fault type {fault.fault_type.value!r} has no PodChaos mapping; "
-            "only pod faults are supported in Phase 1"
+            f"fault type {fault.fault_type.value!r} has no PodChaos mapping"
         )
     if fault.fault_type is FaultType.CONTAINER_KILL and not container_names:
         raise ValueError("container_kill requires at least one container name")
-    if not fault.selector:
-        # An empty labelSelectors matches EVERY pod in the namespace, so the
-        # blast-radius cap would silently apply to unrelated workloads. Refuse.
-        raise ValueError(
-            "fault selector is empty; a PodChaos with no labelSelectors targets "
-            "every pod in the namespace. Provide a selector to bound the blast radius."
-        )
-    spec: dict[str, Any] = {
-        "action": action,
-        "mode": "fixed-percent",
-        # Floor at 1: a sub-1% ratio would round to "0", producing a fault that
-        # selects no pods yet still "succeeds" — a run that scores as resilient
-        # without any fault having occurred.
-        "value": str(max(1, round(fault.ratio * 100))),
-        "duration": f"{fault.duration_seconds}s",
-        "selector": {
-            "namespaces": [namespace],
-            "labelSelectors": dict(fault.selector),
-        },
-    }
+    cr = base_chaos_cr("PodChaos", action, fault, namespace=namespace, name=name)
+    cr["spec"]["action"] = action
     if container_names:
-        spec["containerNames"] = list(container_names)
-    return {
-        "apiVersion": API_VERSION,
-        "kind": "PodChaos",
-        "metadata": {
-            "name": name or f"chaosagent-{action}-{secrets.token_hex(4)}",
-            "namespace": namespace,
-            "labels": {MANAGED_BY_LABEL: MANAGED_BY_VALUE},
-        },
-        "spec": spec,
-    }
+        cr["spec"]["containerNames"] = list(container_names)
+    return cr

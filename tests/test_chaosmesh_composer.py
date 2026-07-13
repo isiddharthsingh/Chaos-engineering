@@ -8,7 +8,8 @@ import pytest
 
 from chaosagent.domain.actions import FaultSpec
 from chaosagent.domain.enums import FaultType
-from chaosagent.faults import UnsupportedFaultError, compose_podchaos
+from chaosagent.execute.kubernetes import PLURALS
+from chaosagent.faults import UnsupportedFaultError, compose_cr, compose_podchaos
 
 _NAME_RE = re.compile(r"\Achaosagent-[a-z-]+-[0-9a-f]{8}\Z")
 
@@ -91,21 +92,25 @@ def test_sub_one_percent_ratio_floors_value_at_1(ratio: float) -> None:
 
 
 @pytest.mark.parametrize(
-    "fault_type",
+    ("fault_type", "block"),
     [
-        FaultType.NETWORK_LATENCY,
-        FaultType.NETWORK_LOSS,
-        FaultType.NETWORK_PARTITION,
-        FaultType.CPU_STRESS,
-        FaultType.MEMORY_STRESS,
-        FaultType.IO_STRESS,
-        FaultType.DNS_CHAOS,
-        FaultType.TIME_SKEW,
+        (FaultType.NETWORK_LATENCY, {"network": {"action": "delay", "latency_ms": 100}}),
+        (FaultType.NETWORK_LOSS, {"network": {"action": "loss", "loss_percent": 10}}),
+        (FaultType.NETWORK_PARTITION, {"network": {"action": "partition"}}),
+        (FaultType.CPU_STRESS, {"stress": {"cpu_workers": 1, "cpu_load_percent": 50}}),
+        (FaultType.MEMORY_STRESS, {"stress": {"memory_workers": 1, "memory_size": "256MB"}}),
+        (FaultType.IO_STRESS, {"io": {"action": "latency", "volume_path": "/d", "delay_ms": 5}}),
+        (FaultType.DNS_CHAOS, {"dns": {"action": "error", "patterns": ("example.com",)}}),
+        (FaultType.TIME_SKEW, {"time": {"time_offset": "-10m"}}),
     ],
 )
-def test_non_pod_faults_raise_until_phase_2(fault_type: FaultType) -> None:
+def test_non_pod_faults_are_refused_by_the_pod_composer(
+    fault_type: FaultType, block: dict[str, object]
+) -> None:
+    # compose_podchaos stays pod-family-only; other families go through their own
+    # composers (dispatched by compose_cr), never silently degraded to PodChaos.
     with pytest.raises(UnsupportedFaultError):
-        compose_podchaos(_fault(fault_type=fault_type), namespace="boutique")
+        compose_podchaos(_fault(fault_type=fault_type, **block), namespace="boutique")
 
 
 # -- Kyverno compatibility across the policy-passable input space ---------------
@@ -124,3 +129,90 @@ def test_policy_passable_faults_pass_kyverno_caps(ratio: float, duration: int) -
     assert int(cr["spec"]["value"]) <= 50  # cap-blast-radius
     assert cr["spec"]["duration"].endswith("s")  # require-experiment-ttl
     assert int(cr["spec"]["duration"][:-1]) <= 900  # fault-duration-cap
+
+
+# -- compose_cr: one dispatcher, every FaultType routed to its kind --------------
+
+_DISPATCH_CASES = [
+    (FaultType.POD_KILL, {}, "PodChaos"),
+    (FaultType.POD_FAILURE, {}, "PodChaos"),
+    (
+        FaultType.CONTAINER_KILL,
+        {"container_names": ("server",)},
+        "PodChaos",
+    ),
+    (
+        FaultType.NETWORK_LATENCY,
+        {"network": {"action": "delay", "latency_ms": 100}},
+        "NetworkChaos",
+    ),
+    (
+        FaultType.NETWORK_LOSS,
+        {"network": {"action": "loss", "loss_percent": 10}},
+        "NetworkChaos",
+    ),
+    (
+        FaultType.NETWORK_PARTITION,
+        {"network": {"action": "partition"}},
+        "NetworkChaos",
+    ),
+    (
+        FaultType.CPU_STRESS,
+        {"stress": {"cpu_workers": 1, "cpu_load_percent": 50}},
+        "StressChaos",
+    ),
+    (
+        FaultType.MEMORY_STRESS,
+        {"stress": {"memory_workers": 1, "memory_size": "256MB"}},
+        "StressChaos",
+    ),
+    (
+        FaultType.IO_STRESS,
+        {"io": {"action": "latency", "volume_path": "/data", "delay_ms": 100}},
+        "IOChaos",
+    ),
+    (
+        FaultType.DNS_CHAOS,
+        {"dns": {"action": "error", "patterns": ("example.com",)}},
+        "DNSChaos",
+    ),
+    (FaultType.TIME_SKEW, {"time": {"time_offset": "-10m"}}, "TimeChaos"),
+]
+
+
+@pytest.mark.parametrize(("fault_type", "extra", "kind"), _DISPATCH_CASES)
+def test_compose_cr_routes_every_fault_type(
+    fault_type: FaultType, extra: dict[str, object], kind: str
+) -> None:
+    fault = _fault(fault_type=fault_type, **extra)
+    cr = compose_cr(fault, namespace="boutique", container_names=fault.container_names)
+    assert cr["kind"] == kind
+    assert cr["metadata"]["namespace"] == "boutique"
+    # Every kind the dispatcher can emit must be deletable by the executor.
+    assert cr["kind"] in PLURALS
+
+
+def test_compose_cr_covers_every_fault_type() -> None:
+    dispatched = {fault_type for fault_type, _, _ in _DISPATCH_CASES}
+    assert dispatched == set(FaultType)
+
+
+def test_compose_cr_forwards_name_and_container_names() -> None:
+    fault = _fault(fault_type=FaultType.CONTAINER_KILL, container_names=("server",))
+    cr = compose_cr(
+        fault, namespace="boutique", name="probe-ok", container_names=fault.container_names
+    )
+    assert cr["metadata"]["name"] == "probe-ok"
+    assert cr["spec"]["containerNames"] == ["server"]
+
+
+def test_compose_cr_refuses_container_names_for_network_faults() -> None:
+    # NetworkChaos has no containerNames; dropping the scoping would silently
+    # widen the blast radius beyond the declared intent.
+    fault = _fault(
+        fault_type=FaultType.NETWORK_LATENCY,
+        network={"action": "delay", "latency_ms": 100},
+        container_names=("istio-proxy",),
+    )
+    with pytest.raises(ValueError, match="cannot be scoped to containers"):
+        compose_cr(fault, namespace="boutique", container_names=fault.container_names)

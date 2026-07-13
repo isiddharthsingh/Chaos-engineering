@@ -1,0 +1,24 @@
+{
+  "title": "cartservice tolerates 100ms latency on a third of its pods",
+  "target_id": "kind-local",
+  "namespace": "boutique",
+  "fault": {
+    "fault_type": "network_latency",
+    "selector": {"app": "cartservice"},
+    "ratio": 0.34,
+    "duration_seconds": 60,
+    "network": {"action": "delay", "latency_ms": 100, "jitter_ms": 10}
+  },
+  "hypotheses": [
+    {
+      "name": "cartservice-replicas-available",
+      "query": "kube_deployment_status_replicas_available{namespace=\"boutique\",deployment=\"cartservice\"}",
+      "comparator": ">=",
+      "threshold": 1
+    }
+  ],
+  "ttl_seconds": 300,
+  "observe_interval_seconds": 5.0,
+  "baseline_seconds": 30,
+  "recovery_seconds": 60
+}
