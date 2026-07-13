@@ -1,0 +1,40 @@
+# Kyverno ClusterPolicy — the k6 twin of `require-chaos-namespace`. The chaos
+# policies match Chaos Mesh kinds only, so without this a k6 TestRun could land
+# in a namespace that never opted in to experiments.
+#
+# Lives in its own file (like the deferred Litmus gate) because Kyverno rejects
+# a policy naming a kind whose CRD is absent — apply this alongside k6-operator.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-chaos-namespace-k6
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Deny any k6 TestRun in a namespace not labelled chaos-enabled=true.
+      Mirrors chaosagent.policy rule id 'require-chaos-namespace' for load.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: load-only-in-labelled-namespace
+      match:
+        any:
+          - resources:
+              kinds:
+                - TestRun
+      context:
+        - name: ns
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}"
+      validate:
+        message: >-
+          [require-chaos-namespace-k6] namespace '{{ request.namespace }}' is not
+          labelled chaos-enabled=true; load injection refused.
+        deny:
+          conditions:
+            any:
+              - key: '{{ ns.metadata.labels."chaos-enabled" || '''' }}'
+                operator: NotEquals
+                value: "true"
