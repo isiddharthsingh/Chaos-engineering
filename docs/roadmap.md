@@ -1,9 +1,10 @@
-# Roadmap — Phase 1 & Phase 2
+# Roadmap — Phases 1–3
 
-This is the build plan for the next two phases, mapped to the existing code so a
-fresh session can start immediately. Phase 0 (foundations + guardrail spine) is
-complete; see [`architecture.md`](architecture.md) for the design and the
-[README](../README.md) for status.
+The build plan for Phases 1–3, mapped to the existing code so a fresh session
+can start immediately. Phase 0 (foundations + guardrail spine) is complete; see
+[`architecture.md`](architecture.md) for the design and the
+[README](../README.md) for status. Each phase has a build-ready spec:
+[`phase-2-plan.md`](phase-2-plan.md), [`phase-3-plan.md`](phase-3-plan.md).
 
 ## What Phase 0 already gives you (reuse, don't rebuild)
 
@@ -109,15 +110,52 @@ multi-fault + load experiment autonomously with the guardrail spine unchanged.
 
 ---
 
+## Phase 3 — Autonomous capacity planning
+
+**Goal:** the agent observes utilization, recommends a bounded replica change,
+applies it through the same guardrail spine, verifies the steady state, and
+**auto-reverts deterministically** on breach — the capacity analogue of
+auto-abort. Cost (OpenCost) is a signal, never an authority.
+
+> **Build-ready spec:** [`phase-3-plan.md`](phase-3-plan.md) has the numbered
+> TDD steps, exact files/signatures, the revert-admissibility design, and the
+> rig verification — point a fresh session there to start implementing. The
+> table below is the summary.
+
+### Components to build
+
+| # | Component | Where | Notes |
+|---|---|---|---|
+| 1 | **Capacity spec + revert-admissible engine rule** — `CapacitySpec` (workload ref, desired replicas, hypotheses, ttl); refuse any change whose *inverse* would breach `replica-cap` (a −50% downscale has a +100% revert) | `src/chaosagent/capacity/spec.py`, `src/chaosagent/policy/engine.py` | `ActionType.SCALE_WORKLOAD`/`RIGHT_SIZE`, `ReplicaChange`, the `replica-cap` rule, and the Kyverno `/scale` twin already exist |
+| 2 | **Scale executor** — gate-checked dry-run + patch of the `/scale` subresource as the experimenter; **ungated bounded revert** (writes only the recorded previous count, abort-delete philosophy) | `src/chaosagent/execute/scale.py` | RBAC scale grants already exist |
+| 3 | **Capacity lifecycle** — PREFLIGHT (engine + server dry-run) → BASELINE → APPLY → OBSERVE settle window → keep on green / **auto-revert on the breaching tick** | `src/chaosagent/capacity/lifecycle.py` | incident-freeze covers capacity; binding TTL reused |
+| 4 | **Deterministic recommender + signals** — utilization vs requests (PromQL) → proportional sizing clamped to the caps; VPA/KEDA/Karpenter read as signals only (writes are Phase 4) | `src/chaosagent/capacity/{signals,recommend}.py` | pure math beneath the LLM; an LLM capacity-planner is an optional addendum |
+| 5 | **OpenCost signal** — `httpx` client feeding an estimated monthly delta into recommendations and reports | `src/chaosagent/capacity/opencost.py` | no new hard dependency; rig installs OpenCost with `--with-rig` |
+| 6 | **CLI** — `chaosagent recommend` (read-only) and `chaosagent scale --spec` (exit 0 kept / 2 denied / 3 auto-reverted / 1 error) | `src/chaosagent/capacity/runner.py`, `cli.py` | mirrors the `run` runner + settings pattern |
+| 7 | **HPA bounds cap (gate before grant)** — Kyverno `cap-hpa-bounds` ships **before** the experimenter gets the HPA write grant, with a manifests pairing test | `config/policies/kyverno/`, `config/rbac/` | the Litmus ordering lesson, enforced in `test_manifests.py` |
+
+### Verify
+`chaosagent recommend` prints a bounded, reproducible recommendation writing
+nothing; `chaosagent scale` applies within the cap and keeps a verified change;
+an engineered post-change breach reverts on the same tick (exit 3); a
+revert-inadmissible downscale (4→2) is denied at PREFLIGHT; an over-cap `/scale`
+patch is denied at admission by `replica-cap`.
+
+### Definition of done
+The agent right-sizes a live workload end to end — observe → recommend → bounded
+apply → verify → keep (or deterministic revert) — on the kind rig, with the
+guardrail spine unchanged and every autonomous change provably revertible under
+the same caps that admitted it.
+
+---
+
 ## Later (context only)
 
-- **Phase 3** — autonomous capacity planning (Karpenter `NodePool` / HPA / KEDA /
-  VPA `InPlaceOrRecreate`) within policy caps; cost signal via OpenCost. The
-  policy engine already has `replica-cap` and the capacity action types.
 - **Phase 4** — multi-cloud (AKS/GKE) + VM faults via `chaosd`/ChaosBlade over
   **SSM (no SSH)**; cloud-service faults via AWS FIS / Azure Chaos Studio;
   **Temporal** for durable multi-hour runs; the human-escalation path for prod
-  (scoped, time-boxed credential); web dashboard.
+  (scoped, time-boxed credential); Karpenter/KEDA/VPA *writes* (cluster-scoped
+  credentials need their own gate design); web dashboard.
 
 ## Key reference
 **ChaosEater** (`ntt-dkiku/chaos-eater`, arXiv:2501.11107) — the closest prior
