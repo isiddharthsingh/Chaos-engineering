@@ -10,6 +10,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chaosagent.domain.actions import FaultSpec
+from chaosagent.load import LoadSpec
 from chaosagent.observe.hypothesis import SteadyStateHypothesis
 
 
@@ -23,6 +24,9 @@ class ExperimentSpec(BaseModel):
     #: The single namespace the experiment lands in (policy re-verifies scope).
     namespace: str = Field(min_length=1)
     fault: FaultSpec
+    #: Optional k6 load applied right after the fault and torn down with it;
+    #: rides the same policy-approved binding (never a second write slot).
+    load: LoadSpec | None = None
     #: The steady state that must hold before, during, and after the fault.
     hypotheses: tuple[SteadyStateHypothesis, ...] = Field(min_length=1)
     #: Bound lifetime of the whole action; also the permission-gate binding TTL.
@@ -47,5 +51,12 @@ class ExperimentSpec(BaseModel):
                 f"ttl_seconds ({self.ttl_seconds}) must exceed baseline_seconds "
                 f"({self.baseline_seconds}); otherwise the write binding expires "
                 "before injection"
+            )
+        if self.load is not None and self.load.ttl_seconds > self.ttl_seconds:
+            # The load's declared lifetime must sit inside the experiment TTL the
+            # policy engine caps — otherwise load.ttl_seconds would be unbounded.
+            raise ValueError(
+                f"load.ttl_seconds ({self.load.ttl_seconds}) must not exceed the "
+                f"experiment ttl_seconds ({self.ttl_seconds})"
             )
         return self

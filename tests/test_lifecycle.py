@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from chaosagent.agents.permission import PermissionGate, RunMode
 from chaosagent.domain.enums import EnvironmentTier, TargetKind
@@ -201,14 +202,141 @@ def test_server_side_dry_run_denial_fails_and_unbinds() -> None:
     assert deps.gate.active_binding() is None
 
 
-def test_unsupported_fault_fails_preflight() -> None:
+def test_composer_refusal_fails_preflight() -> None:
+    # A delay without latency_ms passes the domain model but the composer
+    # refuses it; the run fails in PREFLIGHT before anything is applied.
     spec = _spec(
-        fault={"fault_type": "network_latency", "ratio": 0.34, "duration_seconds": 60}
+        fault={
+            "fault_type": "network_latency",
+            "selector": {"app": "cartservice"},
+            "ratio": 0.34,
+            "duration_seconds": 60,
+            "network": {"action": "delay"},
+        }
     )
-    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}))
+    executor = FakeExecutor()
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
     run = run_lifecycle(spec, deps)
     assert run.state is ExperimentState.FAILED
-    assert run.failure_reason is not None and "network_latency" in run.failure_reason
+    assert run.failed_from is ExperimentState.PREFLIGHT
+    assert run.failure_reason is not None and "latency_ms" in run.failure_reason
+    assert executor.applied == []
+    assert deps.gate.active_binding() is None
+
+
+def test_network_latency_runs_end_to_end() -> None:
+    spec = _spec(
+        title="cartservice survives 100ms latency",
+        fault={
+            "fault_type": "network_latency",
+            "selector": {"app": "cartservice"},
+            "ratio": 0.34,
+            "duration_seconds": 60,
+            "network": {"action": "delay", "latency_ms": 100},
+        },
+    )
+    executor = FakeExecutor()
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(spec, deps)
+    assert run.state is ExperimentState.DONE
+    assert [cr["kind"] for cr in executor.dry_runs] == ["NetworkChaos"]
+    assert executor.applied[0].kind == "NetworkChaos"
+    assert executor.deleted[0].kind == "NetworkChaos"
+    assert run.cr_name == executor.applied[0].name
+
+
+_LOAD = {"script_configmap": "checkout-load", "duration_seconds": 60, "ttl_seconds": 300}
+
+
+def test_load_rides_the_fault_and_rolls_back_with_it() -> None:
+    executor = FakeExecutor()
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(_spec(load=_LOAD), deps)
+    assert run.state is ExperimentState.DONE
+    # Both CRs are server-side dry-run at PREFLIGHT, before anything is applied.
+    assert [cr["kind"] for cr in executor.dry_runs] == ["PodChaos", "TestRun"]
+    # One binding, two CRs: the TestRun rides the fault's policy-approved action.
+    assert [a.kind for a in executor.applied] == ["PodChaos", "TestRun"]
+    assert [d.kind for d in executor.deleted] == ["PodChaos", "TestRun"]
+    assert deps.gate.active_binding() is None
+
+
+def test_inadmissible_load_is_refused_before_any_injection() -> None:
+    # A load the admission layer would deny must fail PREFLIGHT — never after
+    # the fault is already live.
+    executor = FakeExecutor(
+        deny_dry_run="[require-chaos-namespace-k6] refused", deny_dry_run_kind="TestRun"
+    )
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(_spec(load=_LOAD), deps)
+    assert run.state is ExperimentState.FAILED
+    assert run.failed_from is ExperimentState.PREFLIGHT
+    assert run.failure_reason is not None and "require-chaos-namespace-k6" in run.failure_reason
+    assert executor.applied == []
+    assert deps.gate.active_binding() is None
+
+
+def test_missing_script_configmap_is_refused_before_any_injection() -> None:
+    # A TestRun referencing a missing ConfigMap is admitted but starts no load;
+    # the run would score a false pass. The probe refuses at PREFLIGHT.
+    executor = FakeExecutor()
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    deps.configmap_exists = lambda ns, name: False
+    run = run_lifecycle(_spec(load=_LOAD), deps)
+    assert run.state is ExperimentState.FAILED
+    assert run.failed_from is ExperimentState.PREFLIGHT
+    assert run.failure_reason is not None and "checkout-load" in run.failure_reason
+    assert executor.applied == [] and executor.dry_runs == []
+
+
+def test_failed_deletes_of_both_crs_are_both_recorded() -> None:
+    executor = FakeExecutor(fail_delete="api server unavailable")
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(_spec(load=_LOAD), deps)
+    assert run.state is ExperimentState.DONE
+    assert run.rollback_error is not None
+    # Append, never overwrite: the fault CR's failure must not be masked by the
+    # load CR's. The fault delete comes first.
+    fault_name, load_name = (applied.name for applied in executor.applied)
+    assert fault_name in run.rollback_error and load_name in run.rollback_error
+    assert run.rollback_error.index(fault_name) < run.rollback_error.index(load_name)
+
+
+def test_load_ttl_must_sit_inside_the_experiment_ttl() -> None:
+    with pytest.raises(ValidationError, match="load.ttl_seconds"):
+        _spec(load={"script_configmap": "x", "duration_seconds": 60, "ttl_seconds": 400})
+
+
+def test_spec_without_load_applies_nothing_extra() -> None:
+    executor = FakeExecutor()
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(_spec(), deps)
+    assert run.state is ExperimentState.DONE
+    assert [a.kind for a in executor.applied] == ["PodChaos"]
+    assert [d.kind for d in executor.deleted] == ["PodChaos"]
+
+
+def test_abort_deletes_fault_and_load_on_the_breach_tick() -> None:
+    journal: list[str] = []
+    clock = FakeClock(journal=journal)
+    executor = FakeExecutor(journal, clock=clock)
+    metrics = ScriptedPrometheus({_QUERY: [2.0, 2.0, 2.0, 2.0, 0.0]}, journal=journal)
+    run = run_lifecycle(_spec(load=_LOAD), _deps(metrics, clock=clock, executor=executor))
+    assert run.aborted
+    breach_index = journal.index(f"scalar:{_QUERY}=0.0")
+    assert journal[breach_index + 1 : breach_index + 3] == ["delete", "delete"]
+    assert [d.kind for d in executor.deleted[:2]] == ["PodChaos", "TestRun"]
+
+
+def test_load_apply_failure_tears_down_the_fault() -> None:
+    executor = FakeExecutor(deny_apply="k6 refused", deny_apply_kind="TestRun")
+    deps = _deps(ScriptedPrometheus({_QUERY: [2.0]}), executor=executor)
+    run = run_lifecycle(_spec(load=_LOAD), deps)
+    assert run.state is ExperimentState.FAILED
+    assert run.failed_from is ExperimentState.INJECT
+    assert run.failure_reason is not None and "load apply failed" in run.failure_reason
+    assert [d.kind for d in executor.deleted] == ["PodChaos"]
+    assert deps.gate.active_binding() is None
 
 
 def test_baseline_breach_refuses_to_inject() -> None:

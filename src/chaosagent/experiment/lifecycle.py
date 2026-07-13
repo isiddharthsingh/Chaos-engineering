@@ -27,7 +27,8 @@ from chaosagent.domain.enums import ActionType
 from chaosagent.domain.policy import PolicyDecision
 from chaosagent.execute import AppliedExperiment, ExecutionDenied
 from chaosagent.experiment.spec import ExperimentSpec
-from chaosagent.faults import compose_podchaos
+from chaosagent.faults import compose_cr
+from chaosagent.load import compose_testrun
 from chaosagent.observe import (
     HypothesisResult,
     ScalarSource,
@@ -80,6 +81,11 @@ class LifecycleDeps:
     #: Whether an alert/incident is firing for the namespace. None means "no
     #: probe wired" and is treated as no incident; the live runner supplies one.
     incident_active: Callable[[str], bool] | None = None
+    #: Whether a ConfigMap exists in a namespace — (namespace, name) -> bool. A
+    #: k6 TestRun referencing a missing script ConfigMap is admitted but never
+    #: starts any load, so PREFLIGHT refuses when this probe says missing. None
+    #: means "no probe wired"; the live runner supplies one.
+    configmap_exists: Callable[[str, str], bool] | None = None
 
 
 class StateTransition(BaseModel):
@@ -148,7 +154,12 @@ def _safe_delete(deps: LifecycleDeps, applied: AppliedExperiment, run: Experimen
     try:
         deps.executor.delete(applied)
     except Exception as exc:  # noqa: BLE001 — teardown must swallow everything
-        run.rollback_error = f"delete of {applied.name!r} failed: {exc}"
+        message = f"delete of {applied.name!r} failed: {exc}"
+        # Append, never overwrite: teardown now deletes two CRs (fault + load)
+        # and a failed fault delete must not be masked by a later load failure.
+        run.rollback_error = (
+            f"{run.rollback_error}; {message}" if run.rollback_error else message
+        )
 
 
 def _describe_breach(spec: ExperimentSpec, breach: HypothesisResult) -> str:
@@ -211,16 +222,43 @@ def run_lifecycle(
     if not decision.allowed:
         return _fail(run, clock, f"policy pre-flight denied: {decision.reason()}")
     try:
-        cr = compose_podchaos(
+        cr = compose_cr(
             spec.fault, namespace=spec.namespace, container_names=spec.fault.container_names
         )
     except ValueError as exc:  # includes UnsupportedFaultError
         return _fail(run, clock, str(exc))
+    # Compose (and later dry-run) the load alongside the fault, so a run doomed
+    # by an inadmissible or misconfigured load is refused BEFORE any injection.
+    load_cr: dict[str, Any] | None = None
+    if spec.load is not None:
+        load_cr = compose_testrun(spec.load, namespace=spec.namespace)
+        if deps.configmap_exists is not None:
+            try:
+                script_exists = deps.configmap_exists(
+                    spec.namespace, spec.load.script_configmap
+                )
+            except Exception as exc:
+                return _fail(
+                    run,
+                    clock,
+                    f"pre-flight probe failed for ConfigMap "
+                    f"{spec.load.script_configmap!r}: {exc} (failing closed)",
+                )
+            if not script_exists:
+                return _fail(
+                    run,
+                    clock,
+                    f"k6 script ConfigMap {spec.load.script_configmap!r} not found in "
+                    f"namespace {spec.namespace!r}; the TestRun would be admitted but "
+                    "start no load (the ConfigMap must pre-exist)",
+                )
     run.cr_name = str(cr["metadata"]["name"])
     run.cr_namespace = spec.namespace
     binding = deps.gate.bind(action, decision)
     try:
         deps.executor.dry_run(cr, binding)
+        if load_cr is not None:
+            deps.executor.dry_run(load_cr, binding)
     except ExecutionDenied as exc:
         deps.gate.unbind(binding)
         return _fail(run, clock, f"server-side dry-run denied: {exc}")
@@ -263,6 +301,17 @@ def run_lifecycle(
         return _fail(run, clock, f"inject failed: {exc}")
     run.injected_at = applied.applied_at
 
+    # Load rides the SAME policy-approved binding as the fault (the gate is
+    # single-slot by design); it is applied after the fault and torn down with it.
+    applied_load: AppliedExperiment | None = None
+    if load_cr is not None:
+        try:
+            applied_load = deps.executor.apply(load_cr, binding)
+        except Exception as exc:
+            _safe_delete(deps, applied, run)
+            deps.gate.unbind(binding)
+            return _fail(run, clock, f"load apply failed; deleted the fault CR: {exc}")
+
     # -- OBSERVE: poll until the fault's duration elapses or the SLO breaks ----
     _enter(run, ExperimentState.OBSERVE, clock)
     try:
@@ -276,6 +325,8 @@ def run_lifecycle(
     except Exception as exc:
         # Blind with a live fault is not a state we stay in: tear down, fail.
         _safe_delete(deps, applied, run)
+        if applied_load is not None:
+            _safe_delete(deps, applied_load, run)
         deps.gate.unbind(binding)
         return _fail(
             run, clock, f"observation failed with the fault live; deleted CR: {exc}"
@@ -283,9 +334,11 @@ def run_lifecycle(
     run.during_results = list(outcome.results)
 
     if outcome.breached and outcome.breach is not None:
-        # AUTO-ABORT: the delete happens on the breaching tick, before any
+        # AUTO-ABORT: the deletes happen on the breaching tick, before any
         # sleep or bookkeeping. This path is deterministic and beneath the LLM.
         _safe_delete(deps, applied, run)
+        if applied_load is not None:
+            _safe_delete(deps, applied_load, run)
         run.breach_detected_at = outcome.breach.at
         run.aborted_at = clock.now()
         run.abort_reason = _describe_breach(spec, outcome.breach)
@@ -298,6 +351,8 @@ def run_lifecycle(
     # no path leaves a CR live *and* a write binding held.
     _enter(run, ExperimentState.ROLLBACK, clock)
     _safe_delete(deps, applied, run)
+    if applied_load is not None:
+        _safe_delete(deps, applied_load, run)
     deps.gate.unbind(binding)
     try:
         run.recovery_results = list(
