@@ -40,6 +40,9 @@ class FaultSpec(BaseModel):
     ratio: float = Field(default=1.0, gt=0.0, le=1.0)
     #: How long the fault runs before the engine self-reverts.
     duration_seconds: int = Field(gt=0)
+    #: Container names for container-scoped faults (e.g. container_kill); the
+    #: composer requires at least one for those and ignores it otherwise.
+    container_names: tuple[str, ...] = ()
 
 
 class ProposedAction(BaseModel):
