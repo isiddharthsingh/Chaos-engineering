@@ -81,6 +81,11 @@ runs LLM-free from a `--spec` file, without the `agent` extra installed.
 **Goal:** broaden faults, add load generation, mature scoring, and prove **cloud
 parity** by running the *same* agents against one real cluster (e.g. EKS).
 
+> **Build-ready spec:** [`phase-2-plan.md`](phase-2-plan.md) has the numbered
+> TDD steps, exact files/signatures, per-fault CR field mappings, and the rig
+> verification — point a fresh session there to start implementing. The table
+> below is the summary.
+
 ### Components to build
 
 | # | Component | Where | Notes |
@@ -114,4 +119,5 @@ multi-fault + load experiment autonomously with the guardrail spine unchanged.
 
 ## Key reference
 **ChaosEater** (`ntt-dkiku/chaos-eater`, arXiv:2501.11107) — the closest prior
-art: an LLM-driven full chaos cycle on K8s with Chaos Mesh. Study before Phase 1.
+art: an LLM-driven full chaos cycle on K8s with Chaos Mesh. Worth studying for the
+Phase 2 fault library and scoring model.
