@@ -85,20 +85,59 @@ registry, so a caller cannot spoof `environment: dev` for a prod target. Rules
 
 Every structural rule except `single-experiment` has a Kyverno admission twin
 under `config/policies/kyverno` (`cap-replica-change`, `cap-blast-radius`,
-`require-chaos-namespace`, `require-experiment-ttl`), so the caps hold even if a
-CR is applied by hand.
+`require-chaos-namespace` — plus its `-k6` and `-litmus` twins for kinds the
+chaos policies don't match — and `require-experiment-ttl`), so the caps hold
+even if a CR is applied by hand.
 
 Caps live in `config/policies/engine.yaml` (single source of truth). The Kyverno
 bundle mirrors the structural rules server-side; `tests/test_manifests.py` fails
 the build if the two drift.
+
+## Fault library, load, and scoring
+
+`compose_cr` (`src/chaosagent/faults`) dispatches every `FaultType` to a
+per-kind Chaos Mesh composer (PodChaos, NetworkChaos, StressChaos, IOChaos,
+DNSChaos, TimeChaos), each built on one Kyverno-compatible skeleton: `mode:
+fixed-percent` (never `all`), value ≤ 50 by policy, `duration` always set, and
+a bounded blast radius — an empty label selector is refused, as is an empty
+DNSChaos pattern list (which would fault *every* domain). Family-specific knobs
+live in typed parameter blocks on `FaultSpec` (`network`/`stress`/`io`/`dns`/
+`time`); a validator requires exactly the block matching the fault type, so the
+planner's JSON contract updates with the schema.
+
+k6 load (`src/chaosagent/load`) composes a `TestRun` referencing a
+**pre-existing** script ConfigMap (creating ConfigMaps is a write the
+experimenter RBAC deliberately does not grant); the CR is self-bounding like a
+fault (`--duration` from the spec, `cleanup: post`), and parallelism is capped
+on the model since load does not pass the fault-ratio rule. When `spec.load` is
+set, PREFLIGHT server-side dry-runs the TestRun alongside the fault CR and
+probes that the script ConfigMap exists (a TestRun referencing a missing one is
+admitted but starts no load), so a doomed run is refused before any injection;
+the lifecycle then applies it right after INJECT **on the same policy-approved
+binding** as the fault (the gate stays single-slot) and deletes it alongside
+the fault CR on rollback and on abort. `TestRun` has its own
+`require-chaos-namespace-k6` admission gate because the chaos policies match
+Chaos Mesh kinds only.
+
+The analyst scores each hypothesis over Litmus-style probe kinds — `start`
+(one-shot before inject), `continuous` (fault and recovery windows), `end`
+(one-shot after recovery) — with a weighted rubric (`ProbeWeights`) whose
+default (0 / 0.6 / 0.4 / 0) pins the Phase-1 formula exactly; overall score =
+min across hypotheses, capped at 30 on abort.
 
 ## Credential / safety model
 
 - **One ServiceAccount per capability tier**, RBAC-scoped: `agent-observer`
   (get/list/watch only), `agent-experimenter` (create chaos CRs + patch replicas
   in labelled namespaces only). Never cluster-admin.
-- Cloud access via **IRSA / Pod Identity / Workload Identity** (per-pod IAM);
-  VMs via **SSM Run Command with tag-scoped IAM — no SSH keys** (Phase 4).
+- Cloud access via **IRSA / Pod Identity / Workload Identity** (per-pod IAM).
+  On EKS the experimenter SA carries an `eks.amazonaws.com/role-arn` annotation
+  pointing at a least-privilege role (documented in
+  `config/rbac/00-namespace-and-serviceaccounts.yaml`), and the cluster is
+  registered as a `staging` target (`examples/target-eks-staging.json`) whose
+  credential holds a role-ARN *reference*, never a key. The K8s RBAC is
+  identical on kind and EKS — only the cloud IAM edge differs. VMs via **SSM
+  Run Command with tag-scoped IAM — no SSH keys** (Phase 4).
 - **Kyverno admission policies** replace the human approval gate for autonomous
   runs — the machine-speed second signer at the cluster boundary.
 - **Environment scoping is the autonomy boundary.** prod is excluded by separate

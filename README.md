@@ -37,11 +37,12 @@ an autonomous credential** — not a prompt rule, a credential boundary.
 | `src/chaosagent/registry` | Target inventory (env tiers, scope labels, credential refs) |
 | `src/chaosagent/policy` | Deterministic pre-flight policy engine (the "second signer") |
 | `src/chaosagent/agents` | MCP wiring, permission gate + action binding, observer/planner harnesses |
-| `src/chaosagent/faults` | FaultSpec -> Chaos Mesh CR composer (Kyverno-compatible by construction) |
+| `src/chaosagent/faults` | FaultSpec -> Chaos Mesh CR composers; `compose_cr` dispatches every fault family (Kyverno-compatible by construction) |
+| `src/chaosagent/load` | LoadSpec -> k6 `TestRun` composer (load applied during a fault) |
 | `src/chaosagent/observe` | Prometheus client, steady-state hypotheses, observe loop (auto-abort) |
 | `src/chaosagent/execute` | Gate-checked executor (server-side dry-run, ungated abort delete) |
-| `src/chaosagent/experiment` | Experiment spec, lifecycle state machine, `run` command runner |
-| `src/chaosagent/analyze` | Resilience score + deterministic fix suggestions |
+| `src/chaosagent/experiment` | Experiment spec, lifecycle state machine, `run` runner, GameDay `suite` runner |
+| `src/chaosagent/analyze` | Probe-based resilience score (pinned default rubric) + deterministic fix suggestions |
 | `config/policies` | `engine.yaml` (source of truth) + Kyverno admission bundle |
 | `config/rbac` | Tiered ServiceAccounts + least-privilege Roles |
 | `scripts` | Local kind rig bring-up / teardown |
@@ -94,8 +95,14 @@ defensible, against the **shipped** policy config:
   intent/spec → pre-flight (engine + live Kyverno dry-run) → baseline → PodChaos
   inject → PromQL observe loop → deterministic auto-abort on SLO breach →
   rollback → resilience score + fixes. LLM-free `--spec` path included.
-- **Phase 2 — Fault library + load + cloud parity** — next: NetworkChaos/Stress/
-  IO/DNS/Time composers, k6 load, richer scoring, the same agents on EKS.
+- **Phase 2 — Fault library + load + scoring — code complete; EKS parity pending.**
+  `compose_cr` dispatches every fault family (pod / network / stress / io / dns /
+  time) to a Kyverno-compatible composer; optional k6 `TestRun` load rides the
+  fault's policy binding and is torn down with it; Litmus-style probe kinds feed
+  a weighted scoring rubric whose default pins the Phase-1 formula; `chaosagent
+  suite` runs GameDays sequentially (stops on abort or error by default); k6 and Litmus
+  `ChaosEngine` each have their own `chaos-enabled` admission gate. Remaining:
+  the cloud-parity run on EKS (`examples/target-eks-staging.json`, IRSA).
 - Phases 3–4: capacity planning; multi-cloud + VMs + Temporal durability + prod
   escalation.
 

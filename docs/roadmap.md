@@ -81,6 +81,8 @@ runs LLM-free from a `--spec` file, without the `agent` extra installed.
 **Goal:** broaden faults, add load generation, mature scoring, and prove **cloud
 parity** by running the *same* agents against one real cluster (e.g. EKS).
 
+**Status: code complete (components 1–4, 6); the EKS parity run (5) remains.**
+
 > **Build-ready spec:** [`phase-2-plan.md`](phase-2-plan.md) has the numbered
 > TDD steps, exact files/signatures, per-fault CR field mappings, and the rig
 > verification — point a fresh session there to start implementing. The table
@@ -88,14 +90,14 @@ parity** by running the *same* agents against one real cluster (e.g. EKS).
 
 ### Components to build
 
-| # | Component | Where | Notes |
+| # | Component | Where | Status |
 |---|---|---|---|
-| 1 | **Full fault library** — extend the composer to `NetworkChaos` (latency/loss/partition), `StressChaos` (CPU/memory), `IOChaos`, `DNSChaos`, `TimeChaos` | `src/chaosagent/faults/` | `FaultType` enum already lists these; each CR must satisfy the Kyverno caps |
-| 2 | **Load generation** — compose a k6 `TestRun` CRD (k6-operator, GA); run during an experiment; Prometheus remote-write output feeds the verifier | new `src/chaosagent/load/k6.py` | Experimenter RBAC already grants `k6.io/testruns`; add a Kyverno gate if load needs one |
-| 3 | **Resilience scoring maturation** — probes across start/end/continuous windows; a scoring rubric (borrow LitmusChaos' probe model) | `src/chaosagent/analyze/` | |
-| 4 | **Scheduling / GameDay mode** — schedule experiments; run a suite | new `src/chaosagent/experiment/schedule.py` | Respect `single-experiment` policy |
-| 5 | **Cloud parity** — register a real EKS cluster as a target; deploy the same agents; cloud creds via **IRSA / Pod Identity** (per-pod IAM, least privilege) | `config/rbac/` + registry | Chaos Mesh/Litmus install identically into any cluster |
-| 6 | **Litmus namespace gate (deferred from Phase 0)** — add the `chaos-enabled=true` admission policy for `litmuschaos.io ChaosEngine`, then re-add the Litmus write grant to the experimenter Role | `config/policies/kyverno/chaos/`, `config/rbac/02-experimenter-role.yaml` | See the NOTE comments left in those files |
+| 1 | **Full fault library** — extend the composer to `NetworkChaos` (latency/loss/partition), `StressChaos` (CPU/memory), `IOChaos`, `DNSChaos`, `TimeChaos` | `src/chaosagent/faults/` | ✅ typed per-family parameter blocks on `FaultSpec`; per-kind composers on one Kyverno-compatible skeleton; `compose_cr` dispatches every `FaultType` |
+| 2 | **Load generation** — compose a k6 `TestRun` CRD (k6-operator, GA); run during an experiment; Prometheus remote-write output feeds the verifier | `src/chaosagent/load/k6.py` | ✅ `spec.load` applies the TestRun after INJECT on the fault's own binding and deletes it on rollback/abort; `require-chaos-namespace-k6` admission gate added |
+| 3 | **Resilience scoring maturation** — probes across start/end/continuous windows; a scoring rubric (borrow LitmusChaos' probe model) | `src/chaosagent/analyze/` | ✅ probe kinds tag window + kind; weighted rubric defaults pin the Phase-1 formula |
+| 4 | **Scheduling / GameDay mode** — schedule experiments; run a suite | `src/chaosagent/experiment/schedule.py` | ✅ `chaosagent suite`: sequential, stops on abort or operational error by default, `--continue-on-abort`, worst exit code |
+| 5 | **Cloud parity** — register a real EKS cluster as a target; deploy the same agents; cloud creds via **IRSA / Pod Identity** (per-pod IAM, least privilege) | `config/rbac/` + registry | ◻ config shipped (`examples/target-eks-staging.json`, IRSA annotation documented on the experimenter SA); the live EKS run remains |
+| 6 | **Litmus namespace gate (deferred from Phase 0)** — add the `chaos-enabled=true` admission policy for `litmuschaos.io ChaosEngine`, then re-add the Litmus write grant to the experimenter Role | `config/policies/kyverno/chaos/`, `config/rbac/02-experimenter-role.yaml` | ✅ gate ships with the grant; `test_manifests.py` fails the build if they drift |
 
 ### Verify
 An **autonomous multi-fault experiment** against a staging service on **EKS**,
