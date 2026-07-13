@@ -22,7 +22,7 @@ autonomous run:
    -> policy-engine pre-flight check      (src/chaosagent/policy)
      -> RBAC / IAM least privilege         (config/rbac)
        -> environment scoping              dev/staging only; prod excluded by credential
-         -> observability auto-abort       (Phase 1)
+         -> observability auto-abort       (src/chaosagent/observe)
            -> LLM judgement                (src/chaosagent/agents)   <- innermost
 ```
 
@@ -36,11 +36,16 @@ an autonomous credential** — not a prompt rule, a credential boundary.
 | `src/chaosagent/domain` | Typed models: targets, actions, policy decisions |
 | `src/chaosagent/registry` | Target inventory (env tiers, scope labels, credential refs) |
 | `src/chaosagent/policy` | Deterministic pre-flight policy engine (the "second signer") |
-| `src/chaosagent/agents` | MCP wiring, permission gate, Claude Agent SDK harness |
+| `src/chaosagent/agents` | MCP wiring, permission gate + action binding, observer/planner harnesses |
+| `src/chaosagent/faults` | FaultSpec -> Chaos Mesh CR composer (Kyverno-compatible by construction) |
+| `src/chaosagent/observe` | Prometheus client, steady-state hypotheses, observe loop (auto-abort) |
+| `src/chaosagent/execute` | Gate-checked executor (server-side dry-run, ungated abort delete) |
+| `src/chaosagent/experiment` | Experiment spec, lifecycle state machine, `run` command runner |
+| `src/chaosagent/analyze` | Resilience score + deterministic fix suggestions |
 | `config/policies` | `engine.yaml` (source of truth) + Kyverno admission bundle |
 | `config/rbac` | Tiered ServiceAccounts + least-privilege Roles |
 | `scripts` | Local kind rig bring-up / teardown |
-| `examples` | Sample target + action JSON documents |
+| `examples` | Sample target, action, and experiment JSON documents |
 
 ## Quickstart
 
@@ -57,6 +62,15 @@ uv run chaosagent register examples/target-kind-local.json
 uv run chaosagent list
 uv run chaosagent check examples/action-denied-unlabelled-ns.json   # -> denied
 uv run chaosagent check examples/action-allowed-poddelete.json      # -> allowed
+
+# Run one autonomous experiment end to end on the local rig:
+scripts/kind-up.sh --with-rig      # Kyverno + Chaos Mesh + Prometheus + Boutique
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9090:9090 &
+uv run chaosagent run --target kind-local \
+    --spec examples/experiment-cartservice.json --dry-run   # pre-flight only
+uv run chaosagent run --target kind-local \
+    --spec examples/experiment-cartservice.json             # the full loop
+# exit codes: 0 verified | 2 policy denied | 3 auto-aborted on SLO breach
 ```
 
 ## Safety gate (release-gating test)
@@ -67,16 +81,23 @@ defensible, against the **shipped** policy config:
 - a fault **cannot** execute outside a `chaos-enabled=true` namespace,
 - a capacity action **cannot** exceed the replica cap (±50%),
 - **no** state-changing action can reach a prod target,
+- the loop **auto-aborts** within one observe interval of a synthetic SLO breach,
+  deleting the fault CR before any subsequent sleep,
+- an **unbound write cannot reach the cluster** (zero API calls),
 - the engine is **deterministic**.
 
 ## Status
 
 - **Phase 0 — Foundations + guardrail spine — ✅ complete.** Registry, deterministic
   policy engine, Kyverno + RBAC bundle, read-only Claude Agent SDK harness.
-- **Phase 1 — Autonomous chaos MVP on kind** — next: Chaos Mesh CRD composer,
-  PromQL steady-state evaluator, observe loop + auto-abort, resilience scoring.
-- Phases 2–4: fault library + k6 load + cloud K8s; capacity planning; multi-cloud
-  + VMs + Temporal durability + prod escalation.
+- **Phase 1 — Autonomous chaos MVP on kind — ✅ complete.** One command drives
+  intent/spec → pre-flight (engine + live Kyverno dry-run) → baseline → PodChaos
+  inject → PromQL observe loop → deterministic auto-abort on SLO breach →
+  rollback → resilience score + fixes. LLM-free `--spec` path included.
+- **Phase 2 — Fault library + load + cloud parity** — next: NetworkChaos/Stress/
+  IO/DNS/Time composers, k6 load, richer scoring, the same agents on EKS.
+- Phases 3–4: capacity planning; multi-cloud + VMs + Temporal durability + prod
+  escalation.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design and
 [`docs/roadmap.md`](docs/roadmap.md) for the Phase 1 & 2 build plan (components

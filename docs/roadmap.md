@@ -25,10 +25,13 @@ the model make a raw destructive call.
 
 ---
 
-## Phase 1 — Autonomous chaos MVP (local kind cluster)
+## Phase 1 — Autonomous chaos MVP (local kind cluster) — ✅ complete
 
 **Goal:** the agent runs one experiment end-to-end with **no human in the loop**,
 on the local rig, with the guardrail spine intact.
+
+**Shipped as:** `chaosagent run --target <id> (--spec FILE | --intent "...")`.
+Exit codes: 0 verified · 2 policy/pre-flight denied · 3 auto-aborted · 1 error.
 
 ### The loop (one run = one state machine)
 
@@ -40,38 +43,36 @@ intent → PLAN → pre-flight policy self-check (dry-run) → baseline steady-s
 
 ### Components to build
 
-| # | Component | Where | Notes / TDD |
+| # | Component | Where | Status |
 |---|---|---|---|
-| 1 | **Chaos Mesh CR composer** — `FaultSpec` → `PodChaos` CR (fault_type→action, ratio→`mode: fixed-percent`+`value`, selector→`labelSelectors`, duration→`spec.duration`) | new `src/chaosagent/faults/chaosmesh.py` | Pure, TDD-able. **Must** emit CRs that pass the Kyverno bundle (value ≤ 50, duration set & ≤ 900s) — assert that in tests |
-| 2 | **Prometheus client** — instant + range PromQL over the HTTP API (`httpx`, already a dep) | new `src/chaosagent/observe/prometheus.py` | TDD with mocked `httpx` |
-| 3 | **Steady-state hypothesis** — `SteadyStateHypothesis(query, comparator, threshold)` with `.evaluate(client)` | new `src/chaosagent/observe/hypothesis.py` | Pure logic + the client from #2 |
-| 4 | **Executor** — apply/delete the CR via the kubernetes client (or K8s MCP) as the **experimenter** SA; only after policy-allow + dry-run pass | new `src/chaosagent/execute/kubernetes.py` | Wire the `PermissionGate` `EXPERIMENT` path: bind an approved `ProposedAction` to the write |
-| 5 | **Observe loop + auto-abort** — poll Prometheus every N s during injection; on hypothesis breach, delete the CR **immediately** (deterministic, beneath the LLM) | part of the lifecycle | Chaos Mesh also self-reverts on `duration` — abort is the fast path |
-| 6 | **Lifecycle state machine** — PLAN→PREFLIGHT→BASELINE→INJECT→OBSERVE→VERIFY/ABORT→ROLLBACK→REPORT | new `src/chaosagent/experiment/lifecycle.py` | Simple in-process machine; Temporal deferred to Phase 4 |
-| 7 | **Analyst + resilience score** — compare baseline vs during vs recovery, score, emit a Chaos-Toolkit-style report + fixes ("add a PDB", "raise HPA minReplicas") | new `src/chaosagent/analyze/report.py` | Pure given the metric series |
-| 8 | **Planner / Orchestrator agents** — LLM turns intent ("test the cart service's resilience") into a bounded `FaultSpec` + hypothesis + caps | extend `src/chaosagent/agents/` | Emits typed intent only |
-| 9 | **Pre-flight self-check** — `PolicyEngine` (have it) **plus** `kubectl --dry-run=server` / Kyverno; refuse before injecting | uses existing engine | |
+| 1 | **Chaos Mesh CR composer** — `FaultSpec` → `PodChaos` CR (fault_type→action, ratio→`mode: fixed-percent`+`value`, selector→`labelSelectors`, duration→`spec.duration`) | `src/chaosagent/faults/chaosmesh.py` | ✅ Kyverno-compatible by construction (value ≤ 50, duration set, never `mode: all`); asserted across the policy-passable input space |
+| 2 | **Prometheus client** — instant + range PromQL over the HTTP API (`httpx`, already a dep) | `src/chaosagent/observe/prometheus.py` | ✅ sync client, TDD via `httpx.MockTransport` |
+| 3 | **Steady-state hypothesis** — `SteadyStateHypothesis(query, comparator, threshold)` with `.evaluate(client)` | `src/chaosagent/observe/hypothesis.py` | ✅ frozen pydantic; fail-closed `on_no_data`; no `==` comparator |
+| 4 | **Executor** — apply/delete the CR via the kubernetes client as the **experimenter** SA (impersonation); only after policy-allow + dry-run pass | `src/chaosagent/execute/kubernetes.py` | ✅ gate binding wired; abort delete is never gated |
+| 5 | **Observe loop + auto-abort** — poll Prometheus every N s during injection; on hypothesis breach, delete the CR **immediately** (deterministic, beneath the LLM) | `src/chaosagent/observe/loop.py` | ✅ returns on the breaching tick with no sleep after detection |
+| 6 | **Lifecycle state machine** — PLAN→PREFLIGHT→BASELINE→INJECT→OBSERVE→VERIFY/ABORT→ROLLBACK→REPORT | `src/chaosagent/experiment/lifecycle.py` | ✅ sync, injectable `Clock`; Temporal deferred to Phase 4 |
+| 7 | **Analyst + resilience score** — compare baseline vs during vs recovery, score, emit a report + fixes ("add a PDB", "raise minReplicas") | `src/chaosagent/analyze/report.py` | ✅ pinned score, deterministic suggestion table |
+| 8 | **Planner agent** — LLM turns intent into a bounded `ExperimentSpec` (fault + hypotheses + caps) | `src/chaosagent/agents/planner.py` | ✅ read-only MCP stack; typed intent only; one repair turn |
+| 9 | **Pre-flight self-check** — `PolicyEngine` **plus** server-side dry-run (Kyverno admission runs on dry-run) | lifecycle PREFLIGHT | ✅ denial at either layer stops the run before injection |
 
 ### Verify (on the rig)
 
 `scripts/kind-up.sh --with-rig` (Prometheus + Chaos Mesh + Online Boutique), then:
-1. agent autonomously runs a `pod-delete` against a demo service,
-2. **auto-aborts within N seconds** of a synthetic SLO breach,
-3. rolls back and reports a resilience score,
-4. is **blocked by policy** if the target namespace lacks `chaos-enabled=true`.
+1. ✅ `chaosagent run --target kind-local --spec examples/experiment-cartservice.json`
+   runs a pod-kill against cartservice autonomously,
+2. ✅ **auto-aborts within one observe interval** of a synthetic SLO breach (exit 3),
+3. ✅ rolls back (CR deleted) and reports a resilience score,
+4. ✅ is **blocked by policy** (exit 2, `require-chaos-namespace`) if the target
+   namespace lacks `chaos-enabled=true`.
 
-Extend the release-gating test (`tests/test_safety_gate.py`) with:
-> *"the agent always auto-aborts within N seconds of a synthetic SLO breach."*
+The release-gating test (`tests/test_safety_gate.py`) now also asserts:
+> *auto-abort lands within the deadline of a synthetic SLO breach (delete before
+> any sleep)* and *an unbound write cannot reach the cluster*.
 
-### Definition of done
+### Definition of done — met
 One command: intent → autonomous experiment → auto-abort → rollback → report on
-kind, guardrails intact, no human approval, prod unreachable.
-
-### Suggested build order
-Start with **#1 composer + #2/#3 Prometheus + hypothesis** (all pure, no cluster
-needed, fully TDD-able). Then **#4 executor + #5 observe loop** against the
-`--with-rig` cluster. Then **#6 lifecycle** to stitch them, then **#7 report** and
-**#8 the planner agent**.
+kind, guardrails intact, no human approval, prod unreachable. The whole loop also
+runs LLM-free from a `--spec` file, without the `agent` extra installed.
 
 ---
 

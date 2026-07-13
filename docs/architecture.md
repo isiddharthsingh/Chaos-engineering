@@ -15,7 +15,8 @@ run:
    experimenter write access is namespaced by construction.
 4. **Environment scoping** — dev/staging only; **prod excluded by a separate
    credential** that holds no chaos permissions.
-5. **Observability auto-abort** (Phase 1) — native engine stop on SLO breach.
+5. **Observability auto-abort** (`src/chaosagent/observe`) — deterministic CR
+   delete on the breaching tick of an SLO check, beneath the LLM.
 6. **LLM judgement** (`src/chaosagent/agents`) — reasons about intent and results,
    but can never step outside the layers above.
 
@@ -50,12 +51,16 @@ mode; the rest arrive with the lifecycle in Phase 1+.
 
 ## The permission gate
 
-Every MCP tool call passes through `PermissionGate` (installed as the SDK's
-`can_use_tool` callback). Phase 0 runs it in **OBSERVE** mode: reads pass, every
-state-changing tool is refused. Classification is default-deny — a tool is
-treated as a write unless its name tokens positively mark it a read. In Phase 1,
-EXPERIMENT mode admits a write only when the Executor has bound it to a
-policy-approved `ProposedAction`.
+`PermissionGate` is the single write gatekeeper for both paths: every MCP tool
+call passes through `check()` (installed as the SDK's `can_use_tool` callback),
+and the direct-client executor path calls `authorize_write()`. Reads always
+pass; classification is default-deny — a tool is treated as a write unless its
+name tokens positively mark it a read. In **EXPERIMENT** mode a write is
+admitted only while a policy-approved, state-changing `ProposedAction` is
+**bound** to the gate's single slot (`bind()` returns an `ActionBinding` that
+expires with the action's TTL), and only into the bound action's namespace.
+The abort/rollback delete is deliberately *not* gated — moving toward safety
+must never be blockable by an expired binding.
 
 ## The policy engine (pre-flight self-check)
 
