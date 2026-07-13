@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -75,3 +77,16 @@ def test_environment_autonomy_boundary() -> None:
     assert EnvironmentTier.DEV.is_autonomous
     assert EnvironmentTier.STAGING.is_autonomous
     assert not EnvironmentTier.PROD.is_autonomous
+
+
+def test_example_eks_target_is_valid() -> None:
+    path = Path(__file__).resolve().parents[1] / "examples" / "target-eks-staging.json"
+    target = Target.model_validate_json(path.read_text())
+    assert target.kind is TargetKind.KUBERNETES
+    assert target.environment is EnvironmentTier.STAGING
+    assert target.environment.is_autonomous  # staging sits inside the autonomy boundary
+    assert target.provider == "eks"
+    # Cloud credentials are scoped per-pod via IRSA — a role ARN reference, never a key.
+    assert target.credential.iam_role_arn
+    assert target.credential.service_account == "agent-experimenter"
+    assert target.allowed_namespaces  # scoped to named namespaces, never cluster-wide

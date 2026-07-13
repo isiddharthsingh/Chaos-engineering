@@ -1,0 +1,13 @@
+{
+  "id": "eks-staging",
+  "name": "EKS staging cluster",
+  "kind": "kubernetes",
+  "environment": "staging",
+  "provider": "eks",
+  "allowed_namespaces": ["boutique"],
+  "labels": {"team": "platform", "rig": "cloud"},
+  "credential": {
+    "service_account": "agent-experimenter",
+    "iam_role_arn": "arn:aws:iam::123456789012:role/chaosagent-experimenter"
+  }
+}
