@@ -64,7 +64,8 @@ strict = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
 
-# claude_agent_sdk is an optional extra; type-check cleanly with or without it.
+# claude_agent_sdk and kubernetes are optional extras (and kubernetes ships no
+# type stubs); type-check cleanly with or without them.
 [[tool.mypy.overrides]]
-module = ["claude_agent_sdk.*"]
+module = ["claude_agent_sdk.*", "kubernetes.*"]
 ignore_missing_imports = true
