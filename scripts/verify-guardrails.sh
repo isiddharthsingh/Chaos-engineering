@@ -53,9 +53,25 @@ EXP="system:serviceaccount:chaos-agent-system:agent-experimenter"
 [[ "$(kubectl auth can-i create podchaos.chaos-mesh.org -n unlabelled --as="${EXP}")" == "no" ]] \
   && pass "experimenter CANNOT create chaos CRs in unlabelled namespace" \
   || fail "experimenter must not have write access outside its bound namespaces"
-[[ "$(kubectl auth can-i create chaosengines.litmuschaos.io -n "${NS}" --as="${EXP}")" == "no" ]] \
-  && pass "experimenter has no LitmusChaos write grant (ungated CRD)" \
-  || fail "experimenter must not create Litmus chaosengines until a Litmus policy exists"
+[[ "$(kubectl auth can-i create chaosengines.litmuschaos.io -n "${NS}" --as="${EXP}")" == "yes" ]] \
+  && pass "experimenter can create Litmus chaosengines in ${NS}" \
+  || fail "experimenter should hold the Litmus write grant (it ships with the Litmus gate)"
+[[ "$(kubectl auth can-i create chaosengines.litmuschaos.io -n unlabelled --as="${EXP}")" == "no" ]] \
+  && pass "experimenter CANNOT create Litmus chaosengines in unlabelled namespace" \
+  || fail "experimenter must not write Litmus CRs outside its bound namespaces"
+
+# A write grant is only safe UNDER its admission gate. A grant without the CRD
+# is inert, so the invariant is: CRD installed => the gate policy must exist.
+if kubectl get crd chaosengines.litmuschaos.io >/dev/null 2>&1; then
+  kubectl get clusterpolicy require-chaos-namespace-litmus >/dev/null 2>&1 \
+    && pass "Litmus write grant is paired with its admission gate" \
+    || fail "ChaosEngine CRD + write grant present but require-chaos-namespace-litmus is MISSING"
+fi
+if kubectl get crd testruns.k6.io >/dev/null 2>&1; then
+  kubectl get clusterpolicy require-chaos-namespace-k6 >/dev/null 2>&1 \
+    && pass "k6 write grant is paired with its admission gate" \
+    || fail "TestRun CRD + write grant present but require-chaos-namespace-k6 is MISSING"
+fi
 
 echo ">> [4/4] policies are installed and Enforcing"
 if kubectl get clusterpolicy cap-replica-change >/dev/null 2>&1; then
@@ -73,53 +89,133 @@ else
   echo "  NOTE: chaos-mesh not installed; chaos-CR policies apply only with --with-rig"
 fi
 
-podchaos() { # name ns mode [value] [duration] -> PodChaos manifest on stdout
+chaos_cr() { # kind spec-lines name ns mode [value] [duration] -> manifest on stdout
   cat <<EOF
 apiVersion: chaos-mesh.org/v1alpha1
-kind: PodChaos
-metadata: {name: $1, namespace: $2}
+kind: $1
+metadata: {name: $3, namespace: $4}
 spec:
-  action: pod-kill
-  mode: $3
+$2
+  mode: $5
   selector: {labelSelectors: {app: probe}}
 EOF
-  [[ -n "${4:-}" ]] && echo "  value: \"$4\""
-  [[ -n "${5:-}" ]] && echo "  duration: \"$5\""
+  [[ -n "${6:-}" ]] && echo "  value: \"$6\""
+  [[ -n "${7:-}" ]] && echo "  duration: \"$7\""
 }
 
-expect_deny() { # rule-substr name ns mode [value] [duration]
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+expect_deny() { # rule-substr kind spec-lines name ns mode [value] [duration]
   local rule="$1"; shift
-  local name="$1" ns="$2"
-  if podchaos "$@" | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
-    kubectl -n "$ns" delete podchaos "$name" >/dev/null 2>&1 || true
-    fail "$name should be DENIED by $rule"
+  local kind="$1" name="$3" ns="$4"
+  if chaos_cr "$@" | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n "$ns" delete "$(lower "$kind")" "$name" >/dev/null 2>&1 || true
+    fail "$name ($kind) should be DENIED by $rule"
   else
-    grep -q "$rule" /tmp/kc.txt && pass "$name denied by $rule" \
+    grep -q "$rule" /tmp/kc.txt && pass "$name ($kind) denied by $rule" \
       || fail "$name denied, but not by $rule: $(cat /tmp/kc.txt)"
   fi
 }
 
-expect_allow() { # name ns mode [value] [duration]
-  local name="$1" ns="$2"
-  if podchaos "$@" | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
-    kubectl -n "$ns" delete podchaos "$name" >/dev/null 2>&1 || true
-    pass "$name allowed"
+expect_allow() { # kind spec-lines name ns mode [value] [duration]
+  local kind="$1" name="$3" ns="$4"
+  if chaos_cr "$@" | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n "$ns" delete "$(lower "$kind")" "$name" >/dev/null 2>&1 || true
+    pass "$name ($kind) allowed"
   else
-    fail "$name should be allowed: $(cat /tmp/kc.txt)"
+    fail "$name ($kind) should be allowed: $(cat /tmp/kc.txt)"
   fi
 }
 
+POD_SPEC='  action: pod-kill'
+NET_SPEC=$'  action: delay\n  delay: {latency: 100ms}'
+STRESS_SPEC=$'  stressors:\n    cpu: {workers: 1, load: 50}'
+
 if kubectl get crd podchaos.chaos-mesh.org >/dev/null 2>&1 \
    && kubectl get clusterpolicy require-chaos-namespace >/dev/null 2>&1; then
-  echo ">> [chaos] admission gating on real PodChaos resources"
-  expect_deny  require-chaos-namespace probe-a unlabelled one "" 60s
-  expect_deny  require-ttl             probe-b boutique   one
-  expect_deny  fault-duration-cap      dur-long boutique  one "" 24h
-  expect_deny  fault-blast-radius      blast-all boutique all "" 60s
-  expect_deny  fault-blast-radius      blast-90 boutique  fixed-percent 90 60s
-  expect_allow                         probe-ok boutique  fixed-percent 34 300s
+  echo ">> [chaos] admission gating on real chaos CRs"
+  expect_deny  require-chaos-namespace PodChaos "$POD_SPEC" probe-a unlabelled one "" 60s
+  expect_deny  require-ttl             PodChaos "$POD_SPEC" probe-b boutique   one
+  expect_deny  fault-duration-cap      PodChaos "$POD_SPEC" dur-long boutique  one "" 24h
+  expect_deny  fault-blast-radius      PodChaos "$POD_SPEC" blast-all boutique all "" 60s
+  expect_deny  fault-blast-radius      PodChaos "$POD_SPEC" blast-90 boutique  fixed-percent 90 60s
+  expect_allow                         PodChaos "$POD_SPEC" probe-ok boutique  fixed-percent 34 300s
+  expect_deny  fault-blast-radius      NetworkChaos "$NET_SPEC" net-all boutique all "" 60s
+  expect_deny  fault-blast-radius      NetworkChaos "$NET_SPEC" net-90 boutique fixed-percent 90 60s
+  expect_allow                         NetworkChaos "$NET_SPEC" net-ok boutique fixed-percent 34 300s
+  expect_deny  fault-blast-radius      StressChaos "$STRESS_SPEC" stress-all boutique all "" 60s
+  expect_deny  fault-blast-radius      StressChaos "$STRESS_SPEC" stress-90 boutique fixed-percent 90 60s
+  expect_allow                         StressChaos "$STRESS_SPEC" stress-ok boutique fixed-percent 34 300s
 else
   echo ">> [chaos] skipped (needs --with-rig: Chaos Mesh CRDs + chaos policies)"
+fi
+
+litmus_engine() { # name ns -> minimal ChaosEngine manifest on stdout
+  cat <<EOF
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata: {name: $1, namespace: $2}
+spec:
+  engineState: active
+  appinfo: {appns: $2, applabel: "app=probe", appkind: deployment}
+  chaosServiceAccount: agent-experimenter
+  experiments:
+    - name: pod-delete
+EOF
+}
+
+if kubectl get crd chaosengines.litmuschaos.io >/dev/null 2>&1 \
+   && kubectl get clusterpolicy require-chaos-namespace-litmus >/dev/null 2>&1; then
+  echo ">> [litmus] admission gating on ChaosEngine resources"
+  if litmus_engine litmus-a unlabelled | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n unlabelled delete chaosengine litmus-a >/dev/null 2>&1 || true
+    fail "litmus-a should be DENIED by require-chaos-namespace-litmus"
+  else
+    grep -q "require-chaos-namespace-litmus" /tmp/kc.txt \
+      && pass "litmus-a denied by require-chaos-namespace-litmus" \
+      || fail "litmus-a denied, but not by our policy: $(cat /tmp/kc.txt)"
+  fi
+  if litmus_engine litmus-ok boutique | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n boutique delete chaosengine litmus-ok >/dev/null 2>&1 || true
+    pass "litmus-ok allowed in boutique"
+  else
+    fail "litmus-ok should be allowed in boutique: $(cat /tmp/kc.txt)"
+  fi
+else
+  echo ">> [litmus] skipped (needs the ChaosEngine CRD + the Litmus gate policy)"
+fi
+
+k6_testrun() { # name ns -> minimal TestRun manifest on stdout
+  cat <<EOF
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata: {name: $1, namespace: $2}
+spec:
+  parallelism: 1
+  script:
+    configMap: {name: guardrail-probe-script, file: script.js}
+EOF
+}
+
+if kubectl get crd testruns.k6.io >/dev/null 2>&1 \
+   && kubectl get clusterpolicy require-chaos-namespace-k6 >/dev/null 2>&1; then
+  echo ">> [k6] admission gating on TestRun resources"
+  if k6_testrun k6-a unlabelled | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n unlabelled delete testrun k6-a >/dev/null 2>&1 || true
+    fail "k6-a should be DENIED by require-chaos-namespace-k6"
+  else
+    grep -q "require-chaos-namespace-k6" /tmp/kc.txt \
+      && pass "k6-a denied by require-chaos-namespace-k6" \
+      || fail "k6-a denied, but not by our policy: $(cat /tmp/kc.txt)"
+  fi
+  if k6_testrun k6-ok boutique | kubectl apply -f - >/dev/null 2>/tmp/kc.txt; then
+    kubectl -n boutique delete testrun k6-ok >/dev/null 2>&1 || true
+    pass "k6-ok allowed in boutique"
+  else
+    fail "k6-ok should be allowed in boutique: $(cat /tmp/kc.txt)"
+  fi
+else
+  echo ">> [k6] skipped (needs the TestRun CRD + the k6 gate policy)"
 fi
 
 echo ">> ALL GUARDRAIL CHECKS PASSED"

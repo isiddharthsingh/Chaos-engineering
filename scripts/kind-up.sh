@@ -16,6 +16,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WITH_RIG=0
 [[ "${1:-}" == "--with-rig" ]] && WITH_RIG=1
 
+# Kyverno refreshes API discovery on a delay after a CRD lands; a policy naming
+# the new kind is rejected until then. Retry instead of failing the bring-up.
+apply_policy_with_retry() { # file
+  for _ in 1 2 3 4 5 6; do
+    if kubectl apply -f "$1"; then return 0; fi
+    echo "   (kyverno discovery not ready yet; retrying in 10s)"
+    sleep 10
+  done
+  echo "failed to apply $1 after retries"
+  return 1
+}
+
 echo ">> creating kind cluster '${CLUSTER}'"
 if ! kind get clusters | grep -qx "${CLUSTER}"; then
   kind create cluster --name "${CLUSTER}" --wait 120s
@@ -34,6 +46,16 @@ echo ">> installing Kyverno (admission-side guardrails)"
 kubectl apply --server-side --force-conflicts \
   -f https://github.com/kyverno/kyverno/releases/download/v1.13.4/install.yaml
 kubectl -n kyverno rollout status deploy/kyverno-admission-controller --timeout=180s
+
+echo ">> installing the LitmusChaos ChaosEngine CRD (gate target only; no operator)"
+# Just the CRD, pinned: Kyverno rejects a policy naming a kind that does not
+# resolve. Installed in the BASE path because the experimenter RBAC below
+# grants litmuschaos.io writes — the admission gate must exist first.
+kubectl apply --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/litmuschaos/chaos-operator/3.19.0/deploy/crds/chaosengine_crd.yaml
+
+echo ">> applying the Litmus admission gate BEFORE the RBAC grant (order matters)"
+apply_policy_with_retry "${ROOT}/config/policies/kyverno/chaos/require-chaos-namespace-litmus.yaml"
 
 echo ">> applying chaosagent RBAC + base policy bundle"
 kubectl apply -f "${ROOT}/config/rbac/00-namespace-and-serviceaccounts.yaml"
@@ -57,10 +79,20 @@ if [[ "${WITH_RIG}" == "1" ]]; then
     -n chaos-mesh --create-namespace \
     --set chaosDaemon.runtime=containerd \
     --set chaosDaemon.socketPath=/run/containerd/containerd.sock \
+    --set dnsServer.create=true \
     --wait --timeout 10m
 
-  echo ">> applying chaos-CR Kyverno policies (Chaos Mesh CRDs now exist)"
+  echo ">> applying chaos-CR Kyverno policies (Chaos Mesh + Litmus CRDs now exist)"
   kubectl apply -f "${ROOT}/config/policies/kyverno/chaos/"
+
+  echo ">> installing k6-operator (load during faults)"
+  helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
+  helm repo update >/dev/null
+  helm upgrade --install k6-operator grafana/k6-operator \
+    -n k6-operator --create-namespace --wait --timeout 5m
+
+  echo ">> applying k6 load Kyverno policy (k6 CRDs now exist)"
+  apply_policy_with_retry "${ROOT}/config/policies/kyverno/load/require-chaos-namespace-k6.yaml"
 
   echo ">> deploying Online Boutique into 'boutique'"
   kubectl apply -n boutique -f \
