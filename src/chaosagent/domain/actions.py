@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chaosagent.domain.enums import ActionType, EnvironmentTier, FaultType, TargetKind
@@ -23,12 +25,104 @@ class ReplicaChange(BaseModel):
         return (self.desired - self.current) / self.current
 
 
+class NetworkFault(BaseModel):
+    """Parameters for the network fault family (Chaos Mesh ``NetworkChaos``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action: Literal["delay", "loss", "partition"]
+    #: delay -> spec.delay.latency ("<n>ms").
+    latency_ms: int | None = Field(default=None, gt=0)
+    #: delay -> spec.delay.jitter ("<n>ms").
+    jitter_ms: int = Field(default=0, ge=0)
+    #: loss -> spec.loss.loss (percentage; 0 would be a no-op fault, refused).
+    loss_percent: float | None = Field(default=None, gt=0.0, le=100.0)
+    #: delay/loss -> spec.{delay,loss}.correlation (percentage, "0"-"100").
+    correlation_percent: float = Field(default=0.0, ge=0.0, le=100.0)
+    #: -> spec.direction (traffic direction relative to the selected pods).
+    direction: Literal["to", "from", "both"] = "to"
+
+
+class StressFault(BaseModel):
+    """Parameters for the stress fault family (Chaos Mesh ``StressChaos``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: cpu_stress -> spec.stressors.cpu.workers.
+    cpu_workers: int | None = Field(default=None, gt=0)
+    #: cpu_stress -> spec.stressors.cpu.load (1-100 per worker; 0 is a no-op).
+    cpu_load_percent: int | None = Field(default=None, ge=1, le=100)
+    #: memory_stress -> spec.stressors.memory.workers.
+    memory_workers: int | None = Field(default=None, gt=0)
+    #: memory_stress -> spec.stressors.memory.size (e.g. "256MB").
+    memory_size: str | None = Field(default=None, min_length=1)
+
+
+class IOFault(BaseModel):
+    """Parameters for the filesystem fault family (Chaos Mesh ``IOChaos``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action: Literal["latency", "fault"]
+    #: -> spec.volumePath (mount point of the injected volume; required).
+    volume_path: str = Field(min_length=1)
+    #: -> spec.path (glob of affected files; defaults to everything under volumePath).
+    path_glob: str | None = Field(default=None, min_length=1)
+    #: latency -> spec.delay ("<n>ms").
+    delay_ms: int | None = Field(default=None, gt=0)
+    #: fault -> spec.errno (POSIX errno returned to the workload).
+    errno: int | None = Field(default=None, gt=0)
+    #: -> spec.percent (probability an op is affected, 1-100).
+    percent: int = Field(default=100, ge=1, le=100)
+
+
+class DNSFault(BaseModel):
+    """Parameters for the DNS fault family (Chaos Mesh ``DNSChaos``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action: Literal["error", "random"]
+    #: -> spec.patterns (hostname globs the fault applies to).
+    patterns: tuple[str, ...] = ()
+
+
+class TimeFault(BaseModel):
+    """Parameters for the clock-skew fault family (Chaos Mesh ``TimeChaos``)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: -> spec.timeOffset (e.g. "-10m", "100ns").
+    time_offset: str = Field(min_length=1)
+    #: -> spec.clockIds (defaults to CLOCK_REALTIME on the engine side).
+    clock_ids: tuple[str, ...] = ()
+
+
+#: FaultType -> the parameter block it requires (None for the pod family, which
+#: is fully described by the shared selector/ratio/duration fields).
+_PARAM_BLOCKS: dict[FaultType, str | None] = {
+    FaultType.POD_KILL: None,
+    FaultType.POD_FAILURE: None,
+    FaultType.CONTAINER_KILL: None,
+    FaultType.NETWORK_LATENCY: "network",
+    FaultType.NETWORK_LOSS: "network",
+    FaultType.NETWORK_PARTITION: "network",
+    FaultType.CPU_STRESS: "stress",
+    FaultType.MEMORY_STRESS: "stress",
+    FaultType.IO_STRESS: "io",
+    FaultType.DNS_CHAOS: "dns",
+    FaultType.TIME_SKEW: "time",
+}
+
+_BLOCK_FIELDS = ("network", "stress", "io", "dns", "time")
+
+
 class FaultSpec(BaseModel):
     """Parameters for a fault the planner wants an engine to inject.
 
     This is engine-agnostic intent; a composer turns it into a Chaos Mesh CRD or
     a Litmus experiment. Blast-radius fields exist so the policy engine can cap
-    them without understanding any specific engine.
+    them without understanding any specific engine. Family-specific knobs live in
+    exactly one typed parameter block, enforced to match ``fault_type``.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -43,6 +137,27 @@ class FaultSpec(BaseModel):
     #: Container names for container-scoped faults (e.g. container_kill); the
     #: composer requires at least one for those and ignores it otherwise.
     container_names: tuple[str, ...] = ()
+    #: Per-family parameters — exactly the block matching fault_type must be set.
+    network: NetworkFault | None = None
+    stress: StressFault | None = None
+    io: IOFault | None = None
+    dns: DNSFault | None = None
+    time: TimeFault | None = None
+
+    @model_validator(mode="after")
+    def _block_matches_fault_type(self) -> FaultSpec:
+        required = _PARAM_BLOCKS[self.fault_type]
+        for field in _BLOCK_FIELDS:
+            present = getattr(self, field) is not None
+            if field == required and not present:
+                raise ValueError(
+                    f"{self.fault_type.value} requires the '{field}' parameter block"
+                )
+            if field != required and present:
+                raise ValueError(
+                    f"{self.fault_type.value} does not accept the '{field}' parameter block"
+                )
+        return self
 
 
 class ProposedAction(BaseModel):
