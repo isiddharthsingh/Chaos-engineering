@@ -104,3 +104,32 @@ def test_kyverno_policies_enforce_not_audit() -> None:
                     f"{path}: policy must Enforce, not Audit"
                 )
     assert checked, "no Kyverno ClusterPolicy found — test would pass vacuously"
+
+
+def test_litmus_write_grant_ships_with_the_litmus_gate() -> None:
+    # Order matters (Phase 2): the chaos-enabled=true admission gate for
+    # litmuschaos.io must exist before the experimenter may write ChaosEngines,
+    # or a Litmus fault could land in a namespace that never opted in.
+    gate_path = KYVERNO_DIR / "chaos" / "require-chaos-namespace-litmus.yaml"
+    assert gate_path.exists(), "the Litmus namespace-gate policy is missing"
+    policy = next(d for d in _docs(gate_path) if d.get("kind") == "ClusterPolicy")
+    assert policy["spec"]["validationFailureAction"] == "Enforce"
+    kinds = policy["spec"]["rules"][0]["match"]["any"][0]["resources"]["kinds"]
+    assert "ChaosEngine" in kinds
+    assert "require-chaos-namespace" in policy["spec"]["rules"][0]["validate"]["message"]
+
+    roles = [
+        doc
+        for _, doc in _all_manifests()
+        if doc.get("kind") == "Role" and "experimenter" in doc["metadata"]["name"]
+    ]
+    assert roles, "no experimenter Role found — test would pass vacuously"
+    litmus_rules = [
+        rule
+        for role in roles
+        for rule in role.get("rules", [])
+        if "litmuschaos.io" in rule.get("apiGroups", [])
+    ]
+    assert litmus_rules, "experimenter Role lacks the litmuschaos.io grant"
+    assert "chaosengines" in litmus_rules[0]["resources"]
+    assert "create" in litmus_rules[0]["verbs"]

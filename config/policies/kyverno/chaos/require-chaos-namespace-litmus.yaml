@@ -1,0 +1,43 @@
+# Kyverno ClusterPolicy — the LitmusChaos twin of `require-chaos-namespace`.
+# Kyverno rejects a policy naming a kind whose CRD is absent, so this lives in
+# its own file, applied once the litmuschaos.io CRDs exist (kind-up.sh installs
+# the ChaosEngine CRD with --with-rig).
+#
+# Order matters: this gate must be in place BEFORE the experimenter Role grants
+# litmuschaos.io writes (config/rbac/02-experimenter-role.yaml), or a Litmus
+# fault could land in a namespace that never opted in.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-chaos-namespace-litmus
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Deny any LitmusChaos ChaosEngine in a namespace not labelled
+      chaos-enabled=true. Mirrors chaosagent.policy rule id
+      'require-chaos-namespace' for the Litmus engine.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: litmus-only-in-labelled-namespace
+      match:
+        any:
+          - resources:
+              kinds:
+                - ChaosEngine
+      context:
+        - name: ns
+          apiCall:
+            urlPath: "/api/v1/namespaces/{{ request.namespace }}"
+      validate:
+        message: >-
+          [require-chaos-namespace-litmus] namespace '{{ request.namespace }}'
+          is not labelled chaos-enabled=true; fault injection refused.
+        deny:
+          conditions:
+            any:
+              - key: '{{ ns.metadata.labels."chaos-enabled" || '''' }}'
+                operator: NotEquals
+                value: "true"

@@ -24,11 +24,12 @@ rules:
     resources: ["podchaos", "networkchaos", "stresschaos", "iochaos", "dnschaos",
                 "httpchaos", "timechaos", "schedules", "workflows"]
     verbs: ["create", "get", "list", "watch", "delete"]
-  # NOTE: LitmusChaos write access is intentionally NOT granted here. There is no
-  # admission-side chaos-enabled=true gate for litmuschaos.io ChaosEngine yet
-  # (Chaos Mesh is the Phase 0/1 engine); granting create without that gate would
-  # let a Litmus fault into a non-opted-in namespace. Re-add alongside a Litmus
-  # namespace policy in Phase 2.
+  # LitmusChaos faults, admission-gated by require-chaos-namespace-litmus
+  # (config/policies/kyverno/chaos/). The gate ships with this grant — apply the
+  # policy first, or a Litmus fault could land in a non-opted-in namespace.
+  - apiGroups: ["litmuschaos.io"]
+    resources: ["chaosengines"]
+    verbs: ["create", "get", "list", "watch", "delete"]
   # Capacity actions: adjust replicas via the scale subresource. No delete on
   # workloads — the agent scales, it does not remove deployments.
   - apiGroups: ["apps"]
