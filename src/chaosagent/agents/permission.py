@@ -1,16 +1,22 @@
-"""The permission gate — the deterministic ``canUseTool`` enforcement point.
+"""The permission gate — the deterministic write gatekeeper for both paths.
 
-Every MCP tool call the LLM wants to make passes through here first. In Phase 0
-the gate runs in OBSERVE mode and admits only read-only tools; anything that
-could change state is refused before the SDK ever dispatches it. Classification
-is default-deny: a tool is treated as state-changing unless it clearly reads.
+Every MCP tool call the LLM wants to make passes through :meth:`check` (the SDK
+``canUseTool`` callback); the direct-client executor path goes through
+:meth:`authorize_write`. Both admit a write only while a policy-approved action
+is bound to the gate's single, TTL-expiring slot. Classification is
+default-deny: a tool is treated as state-changing unless it clearly reads.
 """
 
 from __future__ import annotations
 
 import re
+import secrets
 from dataclasses import dataclass
 from enum import StrEnum
+
+from chaosagent.clock import Clock, SystemClock
+from chaosagent.domain.actions import ProposedAction
+from chaosagent.domain.policy import PolicyDecision
 
 # Verb tokens that mark a tool as state-changing. Matched against whole tokens
 # (not substrings) so "execute_query" is not mistaken for an "exec".
@@ -137,16 +143,90 @@ class PermissionResult:
         return cls(False, reason)
 
 
-class PermissionGate:
-    """Decides whether a proposed MCP tool call may run.
+class BindingError(RuntimeError):
+    """Raised when an action cannot be bound to the gate's write slot."""
 
-    In Phase 0 this is intentionally simple and total: it admits reads and
-    refuses writes. It exists as a distinct object so Phase 1 can inject the
-    PolicyEngine-bound write path without touching the harness wiring.
+
+@dataclass(frozen=True)
+class ActionBinding:
+    """A policy-approved action bound to the gate for its TTL. Possessing the
+    receipt is not enough — the gate only honours its *active* binding."""
+
+    token: str
+    action: ProposedAction
+    decision: PolicyDecision
+    expires_at: float
+
+
+class PermissionGate:
+    """Decides whether a proposed write may run — one gatekeeper for both the
+    MCP path (:meth:`check`) and the direct-client executor path
+    (:meth:`authorize_write`).
+
+    The gate holds at most one binding at a time (mirrors the
+    ``single-experiment`` policy) and every binding expires with its action's
+    TTL, so an abandoned approval cannot authorise writes indefinitely.
     """
 
-    def __init__(self, mode: RunMode = RunMode.OBSERVE) -> None:
+    def __init__(self, mode: RunMode = RunMode.OBSERVE, *, clock: Clock | None = None) -> None:
         self.mode = mode
+        self._clock: Clock = clock or SystemClock()
+        self._binding: ActionBinding | None = None
+
+    def bind(self, action: ProposedAction, decision: PolicyDecision) -> ActionBinding:
+        """Bind a policy-approved, state-changing action to the write slot."""
+        if self.mode is not RunMode.EXPERIMENT:
+            raise BindingError("actions can only be bound in EXPERIMENT mode")
+        if not decision.allowed:
+            raise BindingError(f"cannot bind a denied action: {decision.reason()}")
+        if not action.action_type.is_state_changing:
+            raise BindingError("only state-changing actions need a binding")
+        if action.ttl_seconds is None:
+            raise BindingError("a bound action must declare ttl_seconds")
+        if self.active_binding() is not None:
+            raise BindingError("an unexpired binding is already active; unbind it first")
+        binding = ActionBinding(
+            token=secrets.token_hex(8),
+            action=action,
+            decision=decision,
+            expires_at=self._clock.now() + action.ttl_seconds,
+        )
+        self._binding = binding
+        return binding
+
+    def unbind(self, binding: ActionBinding) -> None:
+        """Release the slot. Idempotent — the rollback path must never fail here."""
+        if self._binding is not None and self._binding.token == binding.token:
+            self._binding = None
+
+    def active_binding(self) -> ActionBinding | None:
+        """The current binding, or None once it has expired."""
+        binding = self._binding
+        if binding is None:
+            return None
+        if self._clock.now() >= binding.expires_at:
+            self._binding = None
+            return None
+        return binding
+
+    def authorize_write(self, *, namespace: str | None) -> PermissionResult:
+        """Judge a write against the active binding: there must be one, and the
+        write must land in the bound action's namespace."""
+        binding = self.active_binding()
+        if binding is None:
+            return PermissionResult.deny(
+                "write requires a policy-approved action; none is bound"
+            )
+        if namespace is None:
+            return PermissionResult.deny(
+                "write does not declare a namespace; bound writes must be namespaced"
+            )
+        if namespace != binding.action.namespace:
+            return PermissionResult.deny(
+                f"write targets namespace {namespace!r} but the bound action is scoped to "
+                f"{binding.action.namespace!r}"
+            )
+        return PermissionResult.allow(f"write authorized by action binding {binding.token}")
 
     def check(
         self, tool_name: str, tool_input: dict[str, object] | None = None
@@ -157,8 +237,10 @@ class PermissionGate:
             return PermissionResult.deny(
                 f"tool {tool_name!r} is state-changing; harness is in OBSERVE (read-only) mode"
             )
-        # EXPERIMENT mode: raw writes still require a policy-approved action bound
-        # by the executor. Until that binding exists (Phase 1), refuse by default.
-        return PermissionResult.deny(
-            f"tool {tool_name!r} requires a policy-approved action; none is bound"
+        namespace = tool_input.get("namespace") if tool_input else None
+        result = self.authorize_write(
+            namespace=namespace if isinstance(namespace, str) else None
         )
+        if result.allowed:
+            return result
+        return PermissionResult.deny(f"tool {tool_name!r}: {result.reason}")

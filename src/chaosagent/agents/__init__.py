@@ -1,12 +1,25 @@
-"""The agent brain: MCP wiring, the permission gate, and the SDK harness.
+"""The agent brain: MCP wiring, the permission gate, and the SDK harnesses.
 
-Phase 0 ships this in read-only (OBSERVE) mode: the agent can list cluster state
-and query metrics, but the permission gate refuses every state-changing tool
-call. The gate is the ``canUseTool`` enforcement point the plan calls out as the
-natural home for "no prod without approval"; in Phase 1 it gains the
-PolicyEngine-bound path that lets an approved experiment through.
+The permission gate is the ``canUseTool`` enforcement point AND the direct-
+client write gatekeeper: in OBSERVE mode every state-changing call is refused;
+in EXPERIMENT mode a write passes only while the executor has bound a
+policy-approved ``ProposedAction`` to the gate's single, TTL-expiring slot.
 """
 
-from chaosagent.agents.permission import PermissionGate, PermissionResult, RunMode, is_read_only
+from chaosagent.agents.permission import (
+    ActionBinding,
+    BindingError,
+    PermissionGate,
+    PermissionResult,
+    RunMode,
+    is_read_only,
+)
 
-__all__ = ["PermissionGate", "PermissionResult", "RunMode", "is_read_only"]
+__all__ = [
+    "ActionBinding",
+    "BindingError",
+    "PermissionGate",
+    "PermissionResult",
+    "RunMode",
+    "is_read_only",
+]
