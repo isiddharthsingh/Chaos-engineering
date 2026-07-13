@@ -16,6 +16,7 @@ from chaosagent.domain.actions import ProposedAction
 from chaosagent.domain.enums import EnvironmentTier
 from chaosagent.domain.targets import Target
 from chaosagent.experiment.runner import RunSettings, run_experiment
+from chaosagent.experiment.schedule import SuiteSettings, run_suite_command
 from chaosagent.policy import PolicyEngine
 from chaosagent.registry import TargetNotFoundError, TargetRegistry
 from chaosagent.resolve import resolve_action
@@ -80,6 +81,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return run_experiment(settings)
 
 
+def _cmd_suite(args: argparse.Namespace) -> int:
+    settings = SuiteSettings(
+        target_id=args.target,
+        spec_file=args.spec,
+        store=args.store,
+        prometheus_url=args.prom_url,
+        kubeconfig=args.kubeconfig,
+        context=args.context,
+        continue_on_abort=args.continue_on_abort,
+        output=args.output,
+        policy=args.policy,
+    )
+    return run_suite_command(settings)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chaosagent", description=__doc__)
     parser.add_argument("--store", type=Path, default=_DEFAULT_STORE, help="target store path")
@@ -122,6 +138,24 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output", type=Path, help="write the report JSON here")
     run.add_argument("--policy", type=Path, default=None, help="policy config YAML")
     run.set_defaults(func=_cmd_run)
+
+    suite = sub.add_parser(
+        "suite",
+        help="run a GameDay suite (ordered experiments, sequential, stop on abort)",
+    )
+    suite.add_argument("--target", required=True, help="registered target id")
+    suite.add_argument("--spec", type=Path, required=True, help="path to a SuiteSpec JSON document")
+    suite.add_argument(
+        "--continue-on-abort",
+        action="store_true",
+        help="keep running after an aborted or errored experiment (default: stop)",
+    )
+    suite.add_argument("--prom-url", help="Prometheus base URL (or CHAOSAGENT_PROMETHEUS_URL)")
+    suite.add_argument("--kubeconfig", help="kubeconfig path (default: standard discovery)")
+    suite.add_argument("--context", help="kubeconfig context")
+    suite.add_argument("--output", type=Path, help="write the aggregate report JSON here")
+    suite.add_argument("--policy", type=Path, default=None, help="policy config YAML")
+    suite.set_defaults(func=_cmd_suite)
 
     return parser
 

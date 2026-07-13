@@ -28,6 +28,7 @@ from chaosagent.domain.targets import Target
 from chaosagent.execute import (
     ChaosMeshExecutor,
     build_experimenter_api,
+    read_configmap_exists,
     read_namespace_chaos_enabled,
 )
 from chaosagent.experiment.lifecycle import (
@@ -144,7 +145,7 @@ def _apply_overrides(spec: ExperimentSpec, settings: RunSettings) -> ExperimentS
         return 1
 
 
-def _build_live_deps(settings: RunSettings, registry: TargetRegistry) -> LifecycleDeps | int:
+def build_live_deps(settings: RunSettings, registry: TargetRegistry) -> LifecycleDeps | int:
     try:
         api = build_experimenter_api(kubeconfig=settings.kubeconfig, context=settings.context)
     except ImportError:
@@ -168,6 +169,11 @@ def _build_live_deps(settings: RunSettings, registry: TargetRegistry) -> Lifecyc
             namespace, kubeconfig=settings.kubeconfig, context=settings.context
         )
 
+    def _configmap_exists(namespace: str, name: str) -> bool:
+        return read_configmap_exists(
+            namespace, name, kubeconfig=settings.kubeconfig, context=settings.context
+        )
+
     def _incident_active(namespace: str) -> bool:
         # Feeds the engine's incident-freeze rule: refuse to inject while an
         # alert is firing for the namespace. Watchdog is the always-on
@@ -187,7 +193,19 @@ def _build_live_deps(settings: RunSettings, registry: TargetRegistry) -> Lifecyc
         namespace_chaos_enabled=_chaos_enabled,
         concurrent_experiments=executor.count_running,
         incident_active=_incident_active,
+        configmap_exists=_configmap_exists,
     )
+
+
+def exit_code(run: ExperimentRun) -> int:
+    """Map a run record to its process exit code (0/2/3/1, see module docstring)."""
+    if run.aborted:
+        return 3
+    if run.state is ExperimentState.DONE:
+        return 0
+    if run.failed_from in (ExperimentState.PLAN, ExperimentState.PREFLIGHT):
+        return 2
+    return 1
 
 
 def _finish(run: ExperimentRun, settings: RunSettings) -> int:
@@ -203,13 +221,7 @@ def _finish(run: ExperimentRun, settings: RunSettings) -> int:
     if settings.output is not None:
         settings.output.write_text(report.model_dump_json(indent=2))
         print(f"report written to {settings.output}")
-    if run.aborted:
-        return 3
-    if run.state is ExperimentState.DONE:
-        return 0
-    if run.failed_from in (ExperimentState.PLAN, ExperimentState.PREFLIGHT):
-        return 2
-    return 1
+    return exit_code(run)
 
 
 def run_experiment(settings: RunSettings, deps: RunnerDeps | None = None) -> int:
@@ -242,7 +254,7 @@ def run_experiment(settings: RunSettings, deps: RunnerDeps | None = None) -> int
         run = run_lifecycle(spec, deps.lifecycle, dry_run_only=settings.dry_run)
         return _finish(run, settings)
 
-    lifecycle_deps = _build_live_deps(settings, registry)
+    lifecycle_deps = build_live_deps(settings, registry)
     if isinstance(lifecycle_deps, int):
         return lifecycle_deps
     metrics = lifecycle_deps.metrics
