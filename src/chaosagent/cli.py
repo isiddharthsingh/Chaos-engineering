@@ -1,7 +1,7 @@
-"""Minimal CLI: register/list targets and run the pre-flight policy check.
+"""CLI: register/list targets, pre-flight policy checks, and autonomous runs.
 
-Enough to exercise the guardrail spine from a shell without a cluster. The
-richer agent-driven flows arrive with the harness in later phases.
+`register`/`list`/`check` exercise the guardrail spine without a cluster;
+`run` drives one experiment end to end (spec file or LLM intent) on the rig.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from chaosagent.config import load_policy_config
 from chaosagent.domain.actions import ProposedAction
 from chaosagent.domain.enums import EnvironmentTier
 from chaosagent.domain.targets import Target
+from chaosagent.experiment.runner import RunSettings, run_experiment
 from chaosagent.policy import PolicyEngine
 from chaosagent.registry import TargetNotFoundError, TargetRegistry
 from chaosagent.resolve import resolve_action
@@ -59,6 +60,26 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return 0 if decision.allowed else 2
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    settings = RunSettings(
+        target_id=args.target,
+        store=args.store,
+        spec_file=args.spec,
+        intent=args.intent,
+        namespace=args.namespace,
+        prometheus_url=args.prom_url,
+        kubeconfig=args.kubeconfig,
+        context=args.context,
+        interval_seconds=args.interval,
+        baseline_seconds=args.baseline,
+        recovery_seconds=args.recovery,
+        dry_run=args.dry_run,
+        output=args.output,
+        policy=args.policy,
+    )
+    return run_experiment(settings)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chaosagent", description=__doc__)
     parser.add_argument("--store", type=Path, default=_DEFAULT_STORE, help="target store path")
@@ -77,6 +98,30 @@ def build_parser() -> argparse.ArgumentParser:
     chk.add_argument("file", help="path to a ProposedAction JSON document")
     chk.add_argument("--policy", type=Path, default=None, help="policy config YAML")
     chk.set_defaults(func=_cmd_check)
+
+    run = sub.add_parser(
+        "run",
+        help="run one autonomous chaos experiment (plan -> inject -> observe -> report)",
+    )
+    run.add_argument("--target", required=True, help="registered target id")
+    source = run.add_mutually_exclusive_group(required=True)
+    source.add_argument("--spec", type=Path, help="path to an ExperimentSpec JSON document")
+    source.add_argument("--intent", help="natural-language intent (needs the agent extra)")
+    run.add_argument("--namespace", help="namespace for --intent planning")
+    run.add_argument("--prom-url", help="Prometheus base URL (or CHAOSAGENT_PROMETHEUS_URL)")
+    run.add_argument("--kubeconfig", help="kubeconfig path (default: standard discovery)")
+    run.add_argument("--context", help="kubeconfig context")
+    run.add_argument("--interval", type=float, help="observe interval seconds override")
+    run.add_argument("--baseline", type=int, help="baseline window seconds override")
+    run.add_argument("--recovery", type=int, help="recovery window seconds override")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="stop after pre-flight (engine + server-side dry-run); inject nothing",
+    )
+    run.add_argument("--output", type=Path, help="write the report JSON here")
+    run.add_argument("--policy", type=Path, default=None, help="policy config YAML")
+    run.set_defaults(func=_cmd_run)
 
     return parser
 

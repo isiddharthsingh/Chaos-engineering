@@ -1,0 +1,23 @@
+{
+  "title": "cartservice survives a one-third pod kill",
+  "target_id": "kind-local",
+  "namespace": "boutique",
+  "fault": {
+    "fault_type": "pod_kill",
+    "selector": {"app": "cartservice"},
+    "ratio": 0.34,
+    "duration_seconds": 60
+  },
+  "hypotheses": [
+    {
+      "name": "cartservice-replicas-available",
+      "query": "kube_deployment_status_replicas_available{namespace=\"boutique\",deployment=\"cartservice\"}",
+      "comparator": ">=",
+      "threshold": 1
+    }
+  ],
+  "ttl_seconds": 300,
+  "observe_interval_seconds": 5.0,
+  "baseline_seconds": 30,
+  "recovery_seconds": 60
+}
