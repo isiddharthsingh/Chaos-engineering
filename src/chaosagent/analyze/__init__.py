@@ -9,7 +9,11 @@ from chaosagent.analyze.report import (
     ExperimentReport,
     HypothesisVerdict,
     PhaseStats,
+    ProbeKind,
+    ProbeResult,
+    ProbeWeights,
     Suggestion,
+    Window,
     build_report,
     render_text,
 )
@@ -18,7 +22,11 @@ __all__ = [
     "ExperimentReport",
     "HypothesisVerdict",
     "PhaseStats",
+    "ProbeKind",
+    "ProbeResult",
+    "ProbeWeights",
     "Suggestion",
+    "Window",
     "build_report",
     "render_text",
 ]

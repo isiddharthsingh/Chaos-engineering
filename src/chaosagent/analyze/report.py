@@ -1,9 +1,19 @@
 """Build the experiment report: per-phase stats, verdicts, score, and fixes.
 
-The resilience score is pinned:
+The resilience score is a weighted probe rubric (probe kinds borrowed from the
+LitmusChaos model — ``start`` one-shot before the fault, ``continuous`` sampling
+of a window, ``end`` one-shot after recovery):
 
-    per hypothesis: 100 * (0.6 * during_fraction + 0.4 * recovery_fraction)
+    per hypothesis: 100 * ( start_weight    * start_ok
+                          + during_weight   * during_fraction
+                          + recovery_weight * recovery_fraction
+                          + end_weight      * recovered )
     overall:        min across hypotheses, capped at 30.0 if the run aborted
+
+The DEFAULT weights (0 / 0.6 / 0.4 / 0) pin the Phase-1 formula
+``100 * (0.6 * during_fraction + 0.4 * recovery_fraction)`` exactly, so scores
+stay reproducible and comparable across phases; any other rubric must be passed
+explicitly (``build_report(run, weights=...)``) and weights must sum to 1.
 
 The suggestion table is deterministic (no LLM): a fix appears iff its trigger
 condition is present in the data, so reports are reproducible and comparable.
@@ -11,17 +21,71 @@ condition is present in the data, so reports are reproducible and comparable.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+import math
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chaosagent.experiment.lifecycle import ExperimentRun, ExperimentState, StateTransition
 from chaosagent.observe.hypothesis import HypothesisResult
 
-#: Score weighting: holding during the fault matters more than recovering after.
-_DURING_WEIGHT = 0.6
-_RECOVERY_WEIGHT = 0.4
 _ABORT_SCORE_CAP = 30.0
 
 _POD_FAULT_ACTIONS = ("pod_kill", "pod_failure", "container_kill")
+
+
+class ProbeKind(StrEnum):
+    """Litmus-style probe kinds: when (and how often) a hypothesis is checked."""
+
+    START = "start"  # one-shot: the last sample before injection
+    CONTINUOUS = "continuous"  # every sample across a window
+    END = "end"  # one-shot: the last sample of the recovery window
+
+
+class Window(StrEnum):
+    BASELINE = "baseline"
+    DURING = "during"
+    RECOVERY = "recovery"
+
+
+class ProbeWeights(BaseModel):
+    """The scoring rubric: how much each probe contributes to a hypothesis score.
+
+    Defaults pin the Phase-1 formula (0.6 during + 0.4 recovery, one-shots
+    ignored). Weights must sum to 1 so scores stay on the same 0-100 scale.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: start probe (one-shot before the fault). Note: any run this lifecycle
+    #: actually injected passed its baseline gate, so the start probe holds by
+    #: construction there — a nonzero weight mostly rewards having injected at
+    #: all and only discriminates for runs scored from other sources.
+    start: float = Field(default=0.0, ge=0.0, le=1.0)
+    #: continuous probe over the fault window.
+    during: float = Field(default=0.6, ge=0.0, le=1.0)
+    #: continuous probe over the recovery window.
+    recovery: float = Field(default=0.4, ge=0.0, le=1.0)
+    #: end probe (one-shot after recovery).
+    end: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _sums_to_one(self) -> ProbeWeights:
+        total = self.start + self.during + self.recovery + self.end
+        if not math.isclose(total, 1.0, abs_tol=1e-9):
+            raise ValueError(f"probe weights must sum to 1 (got {total})")
+        return self
+
+
+class ProbeResult(BaseModel):
+    """One probe's outcome for one hypothesis, tagged with kind and window."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: ProbeKind
+    window: Window
+    samples: int
+    fraction: float
 
 
 class PhaseStats(BaseModel):
@@ -42,9 +106,12 @@ class HypothesisVerdict(BaseModel):
     during: PhaseStats
     recovery: PhaseStats
     baseline_ok: bool
+    #: The steady state held on the last baseline sample (the start probe).
+    start_ok: bool
     held_during_fault: bool
     #: The steady state was back by the *end* of the recovery window.
     recovered: bool
+    probes: tuple[ProbeResult, ...]
     score: float
 
 
@@ -67,6 +134,9 @@ class ExperimentReport(BaseModel):
     abort_reason: str | None
     time_to_abort_seconds: float | None
     failure_reason: str | None
+    #: Set when a teardown delete could not be confirmed — the CR may still
+    #: exist even though the run completed. Never silently swallowed.
+    rollback_error: str | None
     resilience_score: float
     hypotheses: tuple[HypothesisVerdict, ...]
     suggestions: tuple[Suggestion, ...]
@@ -80,24 +150,57 @@ def _phase_stats(name: str, results: list[HypothesisResult]) -> PhaseStats:
     return PhaseStats(samples=len(samples), satisfied=satisfied, fraction=fraction)
 
 
-def _recovered(name: str, results: list[HypothesisResult]) -> bool:
+def _last_sample_ok(name: str, results: list[HypothesisResult]) -> bool:
     samples = [result for result in results if result.hypothesis_name == name]
     return bool(samples) and samples[-1].satisfied
 
 
-def _verdict(run: ExperimentRun, name: str) -> HypothesisVerdict:
+def _one_shot(kind: ProbeKind, window: Window, ok: bool, taken: bool) -> ProbeResult:
+    # samples=0 when the window never produced a sample — a probe that did not
+    # run must not be reported as an observation that failed.
+    return ProbeResult(
+        kind=kind, window=window, samples=1 if taken else 0, fraction=1.0 if ok else 0.0
+    )
+
+
+def _verdict(run: ExperimentRun, name: str, weights: ProbeWeights) -> HypothesisVerdict:
     baseline = _phase_stats(name, run.baseline_results)
     during = _phase_stats(name, run.during_results)
     recovery = _phase_stats(name, run.recovery_results)
-    score = 100.0 * (_DURING_WEIGHT * during.fraction + _RECOVERY_WEIGHT * recovery.fraction)
+    start_ok = _last_sample_ok(name, run.baseline_results)
+    recovered = _last_sample_ok(name, run.recovery_results)
+    probes = (
+        _one_shot(ProbeKind.START, Window.BASELINE, start_ok, baseline.samples > 0),
+        ProbeResult(
+            kind=ProbeKind.CONTINUOUS,
+            window=Window.DURING,
+            samples=during.samples,
+            fraction=during.fraction,
+        ),
+        ProbeResult(
+            kind=ProbeKind.CONTINUOUS,
+            window=Window.RECOVERY,
+            samples=recovery.samples,
+            fraction=recovery.fraction,
+        ),
+        _one_shot(ProbeKind.END, Window.RECOVERY, recovered, recovery.samples > 0),
+    )
+    score = 100.0 * (
+        weights.start * float(start_ok)
+        + weights.during * during.fraction
+        + weights.recovery * recovery.fraction
+        + weights.end * float(recovered)
+    )
     return HypothesisVerdict(
         name=name,
         baseline=baseline,
         during=during,
         recovery=recovery,
         baseline_ok=baseline.samples > 0 and baseline.fraction == 1.0,
+        start_ok=start_ok,
         held_during_fault=during.samples > 0 and during.fraction == 1.0,
-        recovered=_recovered(name, run.recovery_results),
+        recovered=recovered,
+        probes=probes,
         score=round(score, 1),
     )
 
@@ -150,9 +253,12 @@ def _suggest(run: ExperimentRun, verdicts: tuple[HypothesisVerdict, ...]) -> tup
     return tuple(suggestions)
 
 
-def build_report(run: ExperimentRun) -> ExperimentReport:
-    """Score a finished run. Pure: same run record, same report."""
-    verdicts = tuple(_verdict(run, hypothesis.name) for hypothesis in run.spec.hypotheses)
+def build_report(run: ExperimentRun, *, weights: ProbeWeights | None = None) -> ExperimentReport:
+    """Score a finished run. Pure: same run record (and rubric), same report."""
+    weights = weights or ProbeWeights()
+    verdicts = tuple(
+        _verdict(run, hypothesis.name, weights) for hypothesis in run.spec.hypotheses
+    )
     score = min(verdict.score for verdict in verdicts)
     if run.aborted:
         score = min(score, _ABORT_SCORE_CAP)
@@ -169,6 +275,7 @@ def build_report(run: ExperimentRun) -> ExperimentReport:
         abort_reason=run.abort_reason,
         time_to_abort_seconds=time_to_abort,
         failure_reason=run.failure_reason,
+        rollback_error=run.rollback_error,
         resilience_score=score,
         hypotheses=verdicts,
         suggestions=_suggest(run, verdicts),
@@ -191,6 +298,8 @@ def render_text(report: ExperimentReport) -> str:
             lines.append(f"             detected->deleted in {report.time_to_abort_seconds:.1f}s")
     if report.failure_reason:
         lines.append(f"failure    : {report.failure_reason}")
+    if report.rollback_error:
+        lines.append(f"rollback   : UNCONFIRMED — {report.rollback_error}")
     lines.append("hypotheses :")
     for verdict in report.hypotheses:
         if (verdict.baseline.samples, verdict.during.samples, verdict.recovery.samples) == (

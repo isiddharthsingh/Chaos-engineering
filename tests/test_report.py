@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from chaosagent.analyze import build_report, render_text
+import pytest
+from pydantic import ValidationError
+
+from chaosagent.analyze import ProbeWeights, build_report, render_text
 from chaosagent.experiment import ExperimentRun, ExperimentSpec, ExperimentState, StateTransition
 from chaosagent.observe import HypothesisResult
 
@@ -197,3 +200,97 @@ def test_render_text_carries_the_essentials() -> None:
     assert "replicas" in text
     assert "ABORTED" in text
     assert "add-pdb" in text
+
+
+# -- Probe kinds + the weighted rubric (Phase 2) ---------------------------------
+
+
+def test_probe_results_tag_kind_and_window() -> None:
+    run = _run(
+        baseline=_samples("replicas", [True] * 3),
+        during=_samples("replicas", [True] * 4),
+        recovery=_samples("replicas", [True] * 3),
+    )
+    verdict = build_report(run).hypotheses[0]
+    assert verdict.start_ok is True
+    probes = {(p.kind.value, p.window.value): p for p in verdict.probes}
+    assert set(probes) == {
+        ("start", "baseline"),
+        ("continuous", "during"),
+        ("continuous", "recovery"),
+        ("end", "recovery"),
+    }
+    assert probes[("start", "baseline")].samples == 1  # one-shot
+    assert probes[("continuous", "during")].samples == 4
+    assert probes[("continuous", "recovery")].samples == 3
+    assert probes[("end", "recovery")].samples == 1  # one-shot
+    assert all(p.fraction == 1.0 for p in verdict.probes)
+
+
+def test_start_probe_is_the_last_baseline_sample() -> None:
+    run = _run(
+        baseline=_samples("replicas", [True, True, False]),  # breached at inject time
+        during=_samples("replicas", [True] * 4),
+        recovery=_samples("replicas", [True] * 3),
+    )
+    verdict = build_report(run).hypotheses[0]
+    assert verdict.start_ok is False
+    probes = {(p.kind.value, p.window.value): p.fraction for p in verdict.probes}
+    assert probes[("start", "baseline")] == 0.0
+
+
+def test_default_weights_pin_the_phase_1_formula() -> None:
+    run = _run(
+        baseline=_samples("replicas", [True] * 3),
+        during=_samples("replicas", [True, False, True, False]),  # 0.5 held
+        recovery=_samples("replicas", [True] * 4),
+    )
+    pinned = build_report(run)
+    explicit = build_report(run, weights=ProbeWeights())
+    assert pinned.resilience_score == explicit.resilience_score == 70.0
+
+
+def test_custom_probe_weights_contribute_deterministically() -> None:
+    run = _run(
+        baseline=_samples("replicas", [True] * 3),
+        during=_samples("replicas", [True, False, True, False]),  # 0.5 held
+        recovery=_samples("replicas", [True] * 4),  # recovered, end ok
+    )
+    weights = ProbeWeights(start=0.2, during=0.4, recovery=0.2, end=0.2)
+    report = build_report(run, weights=weights)
+    # 100 * (0.2*1.0 + 0.4*0.5 + 0.2*1.0 + 0.2*1.0) = 80.0
+    assert report.resilience_score == 80.0
+
+
+def test_probe_weights_must_sum_to_one() -> None:
+    with pytest.raises(ValidationError):
+        ProbeWeights(start=0.5, during=0.5, recovery=0.5, end=0.5)
+    with pytest.raises(ValidationError):
+        ProbeWeights(start=-0.2, during=0.6, recovery=0.4, end=0.2)
+
+
+def test_one_shot_probes_report_zero_samples_when_never_taken() -> None:
+    # A preflight-failed run sampled nothing; the report must not fabricate
+    # start/end probe observations that never happened.
+    run = ExperimentRun(
+        run_id="abc123",
+        spec=_spec(),
+        state=ExperimentState.FAILED,
+        transitions=[StateTransition(state=ExperimentState.FAILED, at=0.0)],
+        failure_reason="policy pre-flight denied",
+    )
+    verdict = build_report(run).hypotheses[0]
+    assert all(probe.samples == 0 for probe in verdict.probes)
+
+
+def test_unconfirmed_rollback_is_surfaced_in_the_report() -> None:
+    run = _run(
+        baseline=_samples("replicas", [True] * 3),
+        during=_samples("replicas", [True] * 4),
+        recovery=_samples("replicas", [True] * 3),
+    )
+    run.rollback_error = "delete of 'chaosagent-load-abc' failed: boom"
+    report = build_report(run)
+    assert report.rollback_error == "delete of 'chaosagent-load-abc' failed: boom"
+    text = render_text(report)
+    assert "UNCONFIRMED" in text and "chaosagent-load-abc" in text
