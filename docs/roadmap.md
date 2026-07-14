@@ -117,29 +117,32 @@ applies it through the same guardrail spine, verifies the steady state, and
 **auto-reverts deterministically** on breach — the capacity analogue of
 auto-abort. Cost (OpenCost) is a signal, never an authority.
 
+**Status: code complete (all components); the live kind-rig verification pass
+remains.**
+
 > **Build-ready spec:** [`phase-3-plan.md`](phase-3-plan.md) has the numbered
 > TDD steps, exact files/signatures, the revert-admissibility design, and the
-> rig verification — point a fresh session there to start implementing. The
-> table below is the summary.
+> rig verification. The table below is the summary.
 
 ### Components to build
 
-| # | Component | Where | Notes |
+| # | Component | Where | Status |
 |---|---|---|---|
-| 1 | **Capacity spec + revert-admissible engine rule** — `CapacitySpec` (workload ref, desired replicas, hypotheses, ttl); refuse any change whose *inverse* would breach `replica-cap` (a −50% downscale has a +100% revert) | `src/chaosagent/capacity/spec.py`, `src/chaosagent/policy/engine.py` | `ActionType.SCALE_WORKLOAD`/`RIGHT_SIZE`, `ReplicaChange`, the `replica-cap` rule, and the Kyverno `/scale` twin already exist |
-| 2 | **Scale executor** — gate-checked dry-run + patch of the `/scale` subresource as the experimenter; **ungated bounded revert** (writes only the recorded previous count, abort-delete philosophy) | `src/chaosagent/execute/scale.py` | RBAC scale grants already exist |
-| 3 | **Capacity lifecycle** — PREFLIGHT (engine + server dry-run) → BASELINE → APPLY → OBSERVE settle window → keep on green / **auto-revert on the breaching tick** | `src/chaosagent/capacity/lifecycle.py` | incident-freeze covers capacity; binding TTL reused |
-| 4 | **Deterministic recommender + signals** — utilization vs requests (PromQL) → proportional sizing clamped to the caps; VPA/KEDA/Karpenter read as signals only (writes are Phase 4) | `src/chaosagent/capacity/{signals,recommend}.py` | pure math beneath the LLM; an LLM capacity-planner is an optional addendum |
-| 5 | **OpenCost signal** — `httpx` client feeding an estimated monthly delta into recommendations and reports | `src/chaosagent/capacity/opencost.py` | no new hard dependency; rig installs OpenCost with `--with-rig` |
-| 6 | **CLI** — `chaosagent recommend` (read-only) and `chaosagent scale --spec` (exit 0 kept / 2 denied / 3 auto-reverted / 1 error) | `src/chaosagent/capacity/runner.py`, `cli.py` | mirrors the `run` runner + settings pattern |
-| 7 | **HPA bounds cap (gate before grant)** — Kyverno `cap-hpa-bounds` ships **before** the experimenter gets the HPA write grant, with a manifests pairing test | `config/policies/kyverno/`, `config/rbac/` | the Litmus ordering lesson, enforced in `test_manifests.py` |
+| 1 | **Capacity spec + revert-admissible engine rule** — `CapacitySpec` (workload ref, desired replicas, hypotheses, ttl); refuse any change whose *inverse* would breach `replica-cap` (a −50% downscale has a +100% revert) | `src/chaosagent/capacity/spec.py`, `src/chaosagent/policy/engine.py` | ✅ `revert-admissible` rule (engine-only by design); `test_safety_gate.py` proves every admitted change is revertible under the same caps |
+| 2 | **Scale executor** — gate-checked dry-run + patch of the `/scale` subresource as the experimenter; **ungated bounded revert** (writes only the recorded previous count, abort-delete philosophy) | `src/chaosagent/execute/scale.py` | ✅ Kyverno `cap-replica-change` matches `/scale`, so the dry-run IS the live self-check; revert works with an expired binding and swallows 404 |
+| 3 | **Capacity lifecycle** — PREFLIGHT (engine + server dry-run) → BASELINE → APPLY → OBSERVE settle window → keep on green / **auto-revert on the breaching tick** | `src/chaosagent/capacity/lifecycle.py` | ✅ revert on the breaching tick before any sleep (journal-ordered test); success keeps the change; binding always released |
+| 4 | **Deterministic recommender + signals** — utilization vs requests (PromQL) → proportional sizing clamped to the caps; VPA/KEDA/Karpenter read as signals only (writes are Phase 4) | `src/chaosagent/capacity/{signals,recommend}.py` | ✅ pure math beneath the LLM, clamped to replica-cap + revert-admissible floor; property test: never emits a change the engine would deny; VPA targets fold into the rationale |
+| 5 | **OpenCost signal** — `httpx` client feeding an estimated monthly delta into recommendations and reports | `src/chaosagent/capacity/opencost.py` | ✅ advisory by construction (any failure → None); rig installs OpenCost with `--with-rig` |
+| 6 | **CLI** — `chaosagent recommend` (read-only) and `chaosagent scale --spec` (exit 0 kept / 2 denied / 3 auto-reverted / 1 error) | `src/chaosagent/capacity/runner.py`, `cli.py` | ✅ mirrors the `run` runner + settings pattern; `recommend` deps carry no gate and no executor |
+| 7 | **HPA bounds cap (gate before grant)** — Kyverno `cap-hpa-bounds` ships **before** the experimenter gets the HPA write grant, with a manifests pairing test | `config/policies/kyverno/`, `config/rbac/` | ✅ pairing + anti-drift tests in `test_manifests.py`; engine `replica-cap` judges both HPA bounds; `compose_hpa_patch` is a pure builder |
 
 ### Verify
 `chaosagent recommend` prints a bounded, reproducible recommendation writing
 nothing; `chaosagent scale` applies within the cap and keeps a verified change;
 an engineered post-change breach reverts on the same tick (exit 3); a
 revert-inadmissible downscale (4→2) is denied at PREFLIGHT; an over-cap `/scale`
-patch is denied at admission by `replica-cap`.
+patch is denied at admission by `replica-cap`. ◻ Remaining: this pass on the
+live kind rig (`scripts/kind-up.sh --with-rig && scripts/verify-guardrails.sh`).
 
 ### Definition of done
 The agent right-sizes a live workload end to end — observe → recommend → bounded

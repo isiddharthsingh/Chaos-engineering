@@ -76,18 +76,22 @@ registry, so a caller cannot spoof `environment: dev` for a prod target. Rules
 | `require-namespace-scope` | State-changing K8s actions must name their namespace (non-K8s targets exempt). |
 | `namespace-scope` | The namespace must be within the target's `allowed_namespaces`. |
 | `require-chaos-namespace` | Fault injection **and load** only in `chaos-enabled=true` namespaces. |
-| `replica-cap` | Capacity actions bounded to ±`max_replica_pct_change`. |
+| `replica-cap` | Capacity actions bounded to ±`max_replica_pct_change` — direct scales AND each HPA bound (`HpaBoundsChange` reuses `ReplicaChange` per bound). |
 | `fault-duration-cap` | Faults self-revert within `max_fault_duration_seconds`. |
 | `fault-blast-radius` | A fault targets at most `max_fault_ratio` of matched pods. |
 | `require-ttl` | Chaos/load actions declare a bounded TTL under the ceiling. |
 | `single-experiment` | One chaos experiment at a time per target. |
 | `incident-freeze` | No state-changing action (chaos or capacity) while an alert/incident is firing. |
+| `revert-admissible` | A capacity change whose *inverse* would breach `replica-cap` is refused (downscale floor `desired >= current / (1 + cap)`) — direct scales and each HPA bound alike — so the auto-revert is admissible by construction. |
 
-Every structural rule except `single-experiment` has a Kyverno admission twin
-under `config/policies/kyverno` (`cap-replica-change`, `cap-blast-radius`,
-`require-chaos-namespace` — plus its `-k6` and `-litmus` twins for kinds the
-chaos policies don't match — and `require-experiment-ttl`), so the caps hold
-even if a CR is applied by hand.
+Every structural rule except `single-experiment` and `revert-admissible` has a
+Kyverno admission twin under `config/policies/kyverno` (`cap-replica-change` —
+which matches the `/scale` subresource, so a scale dry-run is a live policy
+check — `cap-hpa-bounds`, `cap-blast-radius`, `require-chaos-namespace` — plus
+its `-k6` and `-litmus` twins for kinds the chaos policies don't match — and
+`require-experiment-ttl`), so the caps hold even if a CR is applied by hand.
+`revert-admissible` is deliberately engine-only: an admission twin would also
+constrain human operators, who can revert in two steps.
 
 Caps live in `config/policies/engine.yaml` (single source of truth). The Kyverno
 bundle mirrors the structural rules server-side; `tests/test_manifests.py` fails
@@ -124,6 +128,52 @@ The analyst scores each hypothesis over Litmus-style probe kinds — `start`
 (one-shot after recovery) — with a weighted rubric (`ProbeWeights`) whose
 default (0 / 0.6 / 0.4 / 0) pins the Phase-1 formula exactly; overall score =
 min across hypotheses, capped at 30 on abort.
+
+## The capacity lifecycle (Phase 3)
+
+The second action family through the same spine. `chaosagent scale` drives:
+
+```
+CapacitySpec -> PLAN -> PREFLIGHT (registry -> incident probe -> live replica
+      read -> engine -> bind -> /scale server-side dry-run) -> BASELINE
+      -> APPLY -> OBSERVE settle window -> VERIFY (change kept)
+                                         | REVERT on the breaching tick
+      -> REPORT -> DONE | FAILED
+```
+
+Three properties carry the safety story:
+
+- **Revert-admissible by construction.** The `revert-admissible` engine rule
+  refuses at PREFLIGHT any change whose inverse the caps would deny (a −50%
+  downscale is capped, but its revert would be +100%), so the deterministic
+  auto-revert can never be blocked by our own guardrails. The release-gating
+  safety test proves the property over a grid: every admitted change's revert
+  is also admitted.
+- **The auto-revert mirrors the abort delete.** It runs on the breaching tick
+  before any sleep, is not gate-checked (moving toward the recorded known-good
+  count must not be blockable by an expired binding), and only ever moves
+  toward `applied.previous` — directly when admissible, or in cap-compliant
+  steps when the live count drifted after apply (the admission cap judges
+  against the live count, so a drifted direct revert could otherwise be denied
+  by our own guardrail). Kyverno still sees every patch — belt and suspenders,
+  not a bypass. Success keeps the change: a verified right-size is the
+  deliverable. A revert that cannot be confirmed is surfaced (`revert_error`,
+  exit 1, `final_replicas: null`) — never reported as a completed revert.
+- **Cost is a signal, never an authority.** `chaosagent recommend` is read-only
+  (its dependency set carries no gate and no executor): utilization vs requests
+  feeds a deterministic proportional recommender clamped to `replica-cap` AND
+  the revert-admissible floor — a property test asserts it can never emit a
+  change the engine would deny. OpenCost supplies an advisory monthly delta
+  (any failure yields "no data", never an error); VPA targets fold into the
+  rationale read-only. VPA/KEDA/Karpenter *writes* are Phase-4 decisions —
+  Karpenter's NodePool is cluster-scoped and would break the namespaced-write
+  invariant.
+
+HPA bounds are the second capacity write family, shipped gate-before-grant:
+the `cap-hpa-bounds` admission policy (same ±50% shape) lands before the
+experimenter's `horizontalpodautoscalers` grant, and `test_manifests.py` fails
+the build if the pairing drifts. This phase recommends bounds
+(`set-hpa-bounds` in reports); it does not move them autonomously.
 
 ## Credential / safety model
 

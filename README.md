@@ -43,6 +43,7 @@ an autonomous credential** — not a prompt rule, a credential boundary.
 | `src/chaosagent/execute` | Gate-checked executor (server-side dry-run, ungated abort delete) |
 | `src/chaosagent/experiment` | Experiment spec, lifecycle state machine, `run` runner, GameDay `suite` runner |
 | `src/chaosagent/analyze` | Probe-based resilience score (pinned default rubric) + deterministic fix suggestions |
+| `src/chaosagent/capacity` | Capacity spec, deterministic recommender + signals (utilization, OpenCost, VPA), auto-reverting scale lifecycle, `recommend`/`scale` runners |
 | `config/policies` | `engine.yaml` (source of truth) + Kyverno admission bundle |
 | `config/rbac` | Tiered ServiceAccounts + least-privilege Roles |
 | `scripts` | Local kind rig bring-up / teardown |
@@ -72,6 +73,22 @@ uv run chaosagent run --target kind-local \
 uv run chaosagent run --target kind-local \
     --spec examples/experiment-cartservice.json             # the full loop
 # exit codes: 0 verified | 2 policy denied | 3 auto-aborted on SLO breach
+
+# Capacity (Phase 3): recommend is read-only; scale keeps a verified change
+# and deterministically auto-reverts on a settle-window breach.
+kubectl -n opencost port-forward svc/opencost 9003:9003 &   # optional cost signal
+uv run chaosagent recommend --target kind-local --namespace boutique \
+    --workload deployment/cartservice --opencost-url http://localhost:9003
+# Stock cartservice runs 1 replica, and no change from 1 fits the +/-50% cap —
+# cap-replica-change matches every /scale update in chaos-enabled namespaces,
+# humans included. Step outside the guardrail deliberately to set the starting
+# point: unlabel, scale, relabel.
+kubectl label namespace boutique chaos-enabled-
+kubectl -n boutique scale deploy/cartservice --replicas=2
+kubectl label namespace boutique chaos-enabled=true --overwrite
+uv run chaosagent scale --target kind-local \
+    --spec examples/capacity-cartservice.json               # 2 -> 3 (+50%)
+# exit codes: 0 change kept | 2 policy denied | 3 auto-reverted | 1 error
 ```
 
 ## Safety gate (release-gating test)
@@ -81,6 +98,9 @@ defensible, against the **shipped** policy config:
 
 - a fault **cannot** execute outside a `chaos-enabled=true` namespace,
 - a capacity action **cannot** exceed the replica cap (±50%),
+- every admitted capacity change is **revertible under the same caps** that
+  admitted it (`revert-admissible`), so the auto-revert can never be blocked
+  by our own guardrails,
 - **no** state-changing action can reach a prod target,
 - the loop **auto-aborts** within one observe interval of a synthetic SLO breach,
   deleting the fault CR before any subsequent sleep,
@@ -103,9 +123,20 @@ defensible, against the **shipped** policy config:
   suite` runs GameDays sequentially (stops on abort or error by default); k6 and Litmus
   `ChaosEngine` each have their own `chaos-enabled` admission gate. Remaining:
   the cloud-parity run on EKS (`examples/target-eks-staging.json`, IRSA).
-- Phases 3–4: capacity planning; multi-cloud + VMs + Temporal durability + prod
-  escalation.
+- **Phase 3 — Autonomous capacity planning — code complete; rig verification
+  pending.** The second action family through the same spine: `chaosagent
+  recommend` (read-only, deterministic proportional sizing clamped to the caps,
+  OpenCost cost delta and VPA targets as advisory signals) and `chaosagent
+  scale` (PREFLIGHT engine + `/scale` server-side dry-run → baseline → apply →
+  settle-window observe → keep on green / **auto-revert on the breaching
+  tick**). A new engine rule (`revert-admissible`) refuses any change whose
+  inverse would breach the replica cap, so every autonomous change is
+  revertible by construction; the HPA bounds admission cap ships before the
+  experimenter's HPA grant (gate before grant, pairing-tested). Remaining: the
+  live kind-rig verification pass.
+- Phase 4: multi-cloud + VMs + Temporal durability + prod escalation +
+  VPA/KEDA/Karpenter writes.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full design and
-[`docs/roadmap.md`](docs/roadmap.md) for the Phase 1 & 2 build plan (components
+[`docs/roadmap.md`](docs/roadmap.md) for the phase build plans (components
 mapped to files, verification, and definition of done).
