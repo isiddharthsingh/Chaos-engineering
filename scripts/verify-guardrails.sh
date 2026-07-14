@@ -3,9 +3,12 @@
 #
 # Asserts, against a REAL API server + Kyverno admission webhook:
 #   1. a Deployment scale of >50% in a chaos-enabled namespace is DENIED,
-#   2. a scale within the +/-50% cap is ALLOWED,
+#   2. a scale within the +/-50% cap is ALLOWED
+#      (both repeated AS the experimenter SA — the identity the Phase 3 scale
+#       executor impersonates),
 #   3. the observer ServiceAccount CANNOT delete (RBAC least privilege),
-#   4. the experimenter has NO cluster-wide write binding.
+#   4. the experimenter has NO cluster-wide write binding,
+#   5. HPA bound changes are capped (cap-hpa-bounds, paired with the HPA grant).
 #
 # Uses only built-in kinds, so it needs Kyverno + the chaosagent bundle but not
 # Chaos Mesh. Run scripts/kind-up.sh first.
@@ -16,7 +19,10 @@ DEP=guardrail-probe
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; exit 1; }
 
-cleanup() { kubectl -n "${NS}" delete deploy "${DEP}" --ignore-not-found >/dev/null 2>&1 || true; }
+cleanup() {
+  kubectl -n "${NS}" delete hpa "${DEP}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "${NS}" delete deploy "${DEP}" --ignore-not-found >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
 echo ">> [1/4] replica-cap: create a 4-replica deployment, then over-scale it"
@@ -36,6 +42,22 @@ if kubectl -n "${NS}" scale deploy/"${DEP}" --replicas=12 2>/tmp/deny.txt; then
 else
   grep -q "replica-cap" /tmp/deny.txt && pass "scale 6->12 (+100%) denied by replica-cap" \
     || fail "denied, but not by our policy: $(cat /tmp/deny.txt)"
+fi
+
+# The same two cases AS THE EXPERIMENTER: the identity the chaosagent scale
+# executor impersonates must be able to make in-cap /scale patches and must be
+# stopped at admission for out-of-cap ones (Phase 3 capacity spine).
+EXP="system:serviceaccount:chaos-agent-system:agent-experimenter"
+if kubectl -n "${NS}" scale deploy/"${DEP}" --replicas=12 --as="${EXP}" 2>/tmp/deny.txt; then
+  fail "scale 6->12 as the experimenter should be DENIED but was allowed"
+else
+  grep -q "replica-cap" /tmp/deny.txt && pass "scale 6->12 as the experimenter denied by replica-cap" \
+    || fail "denied, but not by our policy: $(cat /tmp/deny.txt)"
+fi
+if kubectl -n "${NS}" scale deploy/"${DEP}" --replicas=4 --as="${EXP}" >/dev/null 2>&1; then
+  pass "scale 6->4 (-33%, in cap) as the experimenter allowed"
+else
+  fail "the experimenter should be able to make an in-cap /scale patch"
 fi
 
 echo ">> [2/4] observer RBAC is read-only"
@@ -87,6 +109,34 @@ if kubectl get crd podchaos.chaos-mesh.org >/dev/null 2>&1; then
   fi
 else
   echo "  NOTE: chaos-mesh not installed; chaos-CR policies apply only with --with-rig"
+fi
+
+echo ">> [hpa] cap-hpa-bounds admission gating"
+# A write grant is only safe UNDER its admission gate (same invariant as the
+# chaos engines): experimenter can patch HPAs => cap-hpa-bounds must exist.
+if [[ "$(kubectl auth can-i patch horizontalpodautoscalers.autoscaling -n "${NS}" --as="${EXP}")" == "yes" ]]; then
+  kubectl get clusterpolicy cap-hpa-bounds >/dev/null 2>&1 \
+    && pass "HPA write grant is paired with cap-hpa-bounds" \
+    || fail "experimenter can patch HPAs but cap-hpa-bounds is MISSING"
+fi
+if kubectl get clusterpolicy cap-hpa-bounds >/dev/null 2>&1; then
+  kubectl -n "${NS}" autoscale deployment "${DEP}" --min=4 --max=8 >/dev/null
+  # max 8 -> 12 (+50%) is at the cap and must be allowed.
+  if kubectl -n "${NS}" patch hpa "${DEP}" --type=merge -p '{"spec":{"maxReplicas":12}}' >/dev/null 2>&1; then
+    pass "HPA maxReplicas 8->12 (+50%, at cap) allowed"
+  else
+    fail "HPA maxReplicas 8->12 should be allowed but was denied"
+  fi
+  # max 12 -> 20 (+67%) must be denied by cap-hpa-bounds.
+  if kubectl -n "${NS}" patch hpa "${DEP}" --type=merge -p '{"spec":{"maxReplicas":20}}' 2>/tmp/deny.txt; then
+    fail "HPA maxReplicas 12->20 (+67%) should be DENIED but was allowed"
+  else
+    grep -q "replica-cap" /tmp/deny.txt && pass "HPA maxReplicas 12->20 (+67%) denied by replica-cap" \
+      || fail "denied, but not by our policy: $(cat /tmp/deny.txt)"
+  fi
+  kubectl -n "${NS}" delete hpa "${DEP}" >/dev/null 2>&1 || true
+else
+  fail "cap-hpa-bounds ClusterPolicy is missing"
 fi
 
 chaos_cr() { # kind spec-lines name ns mode [value] [duration] -> manifest on stdout

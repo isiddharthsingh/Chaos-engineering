@@ -6,7 +6,8 @@
 # spine (Phase 0).
 #
 # Full rig (--with-rig, slower): also installs kube-prometheus-stack, Chaos Mesh,
-# and the Online Boutique demo app for the Phase 1 chaos loop.
+# k6-operator, OpenCost (the Phase 3 cost signal), and the Online Boutique demo
+# app for the chaos + capacity loops.
 #
 # Usage: scripts/kind-up.sh [--with-rig]
 set -euo pipefail
@@ -64,6 +65,9 @@ kubectl apply -f "${ROOT}/config/rbac/02-experimenter-role.yaml"
 # Built-in-kind policies apply now; chaos-CR policies need Chaos Mesh CRDs first
 # (applied in the --with-rig branch below).
 kubectl apply -f "${ROOT}/config/policies/kyverno/cap-replica-change.yaml"
+# The HPA bounds cap ships BEFORE the experimenter's autoscaling grant above is
+# usable in anger (gate before grant; test_manifests.py enforces the pairing).
+kubectl apply -f "${ROOT}/config/policies/kyverno/cap-hpa-bounds.yaml"
 
 if [[ "${WITH_RIG}" == "1" ]]; then
   echo ">> installing kube-prometheus-stack"
@@ -93,6 +97,16 @@ if [[ "${WITH_RIG}" == "1" ]]; then
 
   echo ">> applying k6 load Kyverno policy (k6 CRDs now exist)"
   apply_policy_with_retry "${ROOT}/config/policies/kyverno/load/require-chaos-namespace-k6.yaml"
+
+  echo ">> installing OpenCost (Phase 3 cost signal), wired to the kps Prometheus"
+  helm repo add opencost https://opencost.github.io/opencost-helm-chart >/dev/null 2>&1 || true
+  helm repo update >/dev/null
+  helm upgrade --install opencost opencost/opencost \
+    -n opencost --create-namespace \
+    --set opencost.prometheus.internal.serviceName=kps-kube-prometheus-stack-prometheus \
+    --set opencost.prometheus.internal.namespaceName=monitoring \
+    --set opencost.prometheus.internal.port=9090 \
+    --wait --timeout 5m
 
   echo ">> deploying Online Boutique into 'boutique'"
   kubectl apply -n boutique -f \
