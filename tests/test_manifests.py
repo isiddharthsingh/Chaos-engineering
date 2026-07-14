@@ -106,6 +106,57 @@ def test_kyverno_policies_enforce_not_audit() -> None:
     assert checked, "no Kyverno ClusterPolicy found — test would pass vacuously"
 
 
+def test_hpa_write_grant_ships_with_the_hpa_bounds_gate() -> None:
+    # Order matters (the Litmus lesson, applied to capacity): the admission cap
+    # on HPA bound changes must exist before the experimenter may write
+    # HorizontalPodAutoscalers, or a bound change could exceed the cap.
+    gate_path = KYVERNO_DIR / "cap-hpa-bounds.yaml"
+    assert gate_path.exists(), "the cap-hpa-bounds policy is missing"
+    policy = next(d for d in _docs(gate_path) if d.get("kind") == "ClusterPolicy")
+    assert policy["spec"]["validationFailureAction"] == "Enforce"
+    names = {rule["name"] for rule in policy["spec"]["rules"]}
+    assert {"bound-min-replicas-percentage", "bound-max-replicas-percentage"} <= names
+    for rule in policy["spec"]["rules"]:
+        kinds = rule["match"]["any"][0]["resources"]["kinds"]
+        assert "HorizontalPodAutoscaler" in kinds, f"rule {rule['name']} must match HPAs"
+        # Denials carry the engine rule id, so both layers read identically.
+        assert "replica-cap" in rule["validate"]["message"]
+
+    roles = [
+        doc
+        for _, doc in _all_manifests()
+        if doc.get("kind") == "Role" and "experimenter" in doc["metadata"]["name"]
+    ]
+    assert roles, "no experimenter Role found — test would pass vacuously"
+    hpa_rules = [
+        rule
+        for role in roles
+        for rule in role.get("rules", [])
+        if "autoscaling" in rule.get("apiGroups", [])
+    ]
+    assert hpa_rules, "experimenter Role lacks the autoscaling grant"
+    assert "horizontalpodautoscalers" in hpa_rules[0]["resources"]
+    assert {"get", "patch", "update"} <= set(hpa_rules[0]["verbs"])
+    assert "delete" not in hpa_rules[0]["verbs"], "the agent bounds HPAs, never deletes them"
+
+
+def test_hpa_bounds_cap_matches_engine_config() -> None:
+    # Anti-drift, same shape as the replica-cap check: both HPA bound rules must
+    # deny when the fractional change is GreaterThan the engine's cap.
+    cap = load_policy_config().max_replica_pct_change
+    docs = _docs(KYVERNO_DIR / "cap-hpa-bounds.yaml")
+    policy = next(d for d in docs if d.get("kind") == "ClusterPolicy")
+    for rule in policy["spec"]["rules"]:
+        conditions = rule["validate"]["deny"]["conditions"]["any"]
+        match = [
+            c for c in conditions if c.get("operator") == "GreaterThan" and c.get("value") == cap
+        ]
+        assert match, (
+            f"{rule['name']} must deny when the ratio is GreaterThan {cap}; "
+            f"found conditions: {conditions}"
+        )
+
+
 def test_litmus_write_grant_ships_with_the_litmus_gate() -> None:
     # Order matters (Phase 2): the chaos-enabled=true admission gate for
     # litmuschaos.io must exist before the experimenter may write ChaosEngines,

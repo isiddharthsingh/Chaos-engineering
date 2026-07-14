@@ -1,0 +1,89 @@
+# Kyverno ClusterPolicy — admission cap for the SECOND capacity write family.
+# A single agent-driven change to an HPA's bounds must not move minReplicas or
+# maxReplicas by more than max_replica_pct_change (0.5). Applies in namespaces
+# the agent can write to (labelled chaos-enabled=true).
+#
+# Ships BEFORE the experimenter's autoscaling RBAC grant (the Litmus lesson):
+# tests/test_manifests.py::test_hpa_write_grant_ships_with_the_hpa_bounds_gate
+# fails the build if the grant exists without this policy.
+#
+# The denial message carries the ENGINE rule id (replica-cap) so a Python
+# pre-flight denial and a server-side denial read identically.
+#
+# NOTE: keep the 0.5 threshold in sync with config/policies/engine.yaml.
+# tests/test_manifests.py::test_hpa_bounds_cap_matches_engine_config fails the
+# build if this value drifts from the engine's max_replica_pct_change.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cap-hpa-bounds
+  labels:
+    app.kubernetes.io/part-of: chaosagent
+  annotations:
+    policies.kyverno.io/description: >-
+      Cap HorizontalPodAutoscaler min/max bound changes at +/-50%. Mirrors
+      chaosagent.policy rule id 'replica-cap' for the HPA write family.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: bound-min-replicas-percentage
+      match:
+        any:
+          - resources:
+              kinds:
+                - HorizontalPodAutoscaler
+              operations: ["UPDATE"]
+              namespaceSelector:
+                matchLabels:
+                  chaos-enabled: "true"
+      # minReplicas defaults to 1 when unset (autoscaling/v2).
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.minReplicas || `1` }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          [replica-cap] HPA minReplicas change from
+          {{ request.oldObject.spec.minReplicas || `1` }} to
+          {{ request.object.spec.minReplicas || `1` }} exceeds the +/-50% cap.
+        deny:
+          conditions:
+            any:
+              - key: >-
+                  {{ divide(abs(subtract(request.object.spec.minReplicas || `1`,
+                  request.oldObject.spec.minReplicas || `1`)),
+                  request.oldObject.spec.minReplicas || `1`) }}
+                operator: GreaterThan
+                value: 0.5
+    - name: bound-max-replicas-percentage
+      match:
+        any:
+          - resources:
+              kinds:
+                - HorizontalPodAutoscaler
+              operations: ["UPDATE"]
+              namespaceSelector:
+                matchLabels:
+                  chaos-enabled: "true"
+      # maxReplicas is required and >= 1 by the API schema.
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.spec.maxReplicas || `0` }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        message: >-
+          [replica-cap] HPA maxReplicas change from
+          {{ request.oldObject.spec.maxReplicas }} to
+          {{ request.object.spec.maxReplicas }} exceeds the +/-50% cap.
+        deny:
+          conditions:
+            any:
+              - key: >-
+                  {{ divide(abs(subtract(request.object.spec.maxReplicas,
+                  request.oldObject.spec.maxReplicas)),
+                  request.oldObject.spec.maxReplicas) }}
+                operator: GreaterThan
+                value: 0.5

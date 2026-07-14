@@ -42,6 +42,13 @@ rules:
   - apiGroups: ["k6.io"]
     resources: ["testruns"]
     verbs: ["create", "get", "list", "watch", "delete"]
+  # HPA bounds (Phase 3), admission-gated by cap-hpa-bounds
+  # (config/policies/kyverno/cap-hpa-bounds.yaml). The gate ships with this
+  # grant — apply the policy first, or a bound change could exceed the cap.
+  # No delete: the agent bounds autoscalers, it does not remove them.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
