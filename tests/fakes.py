@@ -115,6 +115,37 @@ class FakeExecutor:
         self.deleted.append(applied)
 
 
+class FakeScaleApi:
+    """ScaleApiProtocol stand-in with a scripted replica count; a real (non-dry-
+    run) patch updates it. Failures are scripted via ``patch_error``/``read_error``."""
+
+    def __init__(self, current: int = 4, journal: Journal | None = None) -> None:
+        self.current = current
+        self.journal: Journal = journal if journal is not None else []
+        self.reads: list[tuple[str, str, str]] = []
+        #: (kind, name, namespace, replicas, dry_run) per successful patch call.
+        self.patches: list[tuple[str, str, str, int, str]] = []
+        self.patch_error: Exception | None = None
+        self.read_error: Exception | None = None
+
+    def read_scale(self, kind: str, name: str, namespace: str) -> int:
+        self.journal.append("read_scale")
+        if self.read_error is not None:
+            raise self.read_error
+        self.reads.append((kind, name, namespace))
+        return self.current
+
+    def patch_scale(
+        self, kind: str, name: str, namespace: str, replicas: int, *, dry_run: str | None = None
+    ) -> None:
+        self.journal.append(f"patch_scale:{replicas}" + (":dry" if dry_run else ""))
+        if self.patch_error is not None:
+            raise self.patch_error
+        self.patches.append((kind, name, namespace, replicas, dry_run or ""))
+        if dry_run is None:
+            self.current = replicas
+
+
 class FakeApiException(Exception):
     """Duck-typed stand-in for kubernetes.client.rest.ApiException."""
 

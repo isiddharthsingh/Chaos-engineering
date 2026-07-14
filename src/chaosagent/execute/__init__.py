@@ -14,13 +14,23 @@ from chaosagent.execute.kubernetes import (
     read_configmap_exists,
     read_namespace_chaos_enabled,
 )
+from chaosagent.execute.scale import (
+    AppliedScale,
+    ScaleApiProtocol,
+    ScaleExecutor,
+    build_scale_api,
+)
 
 __all__ = [
     "PLURALS",
     "AppliedExperiment",
+    "AppliedScale",
     "ChaosMeshExecutor",
     "ExecutionDenied",
+    "ScaleApiProtocol",
+    "ScaleExecutor",
     "build_experimenter_api",
+    "build_scale_api",
     "read_configmap_exists",
     "read_namespace_chaos_enabled",
 ]
