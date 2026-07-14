@@ -81,21 +81,63 @@ def _namespace_scope(action: ProposedAction, config: PolicyConfig) -> Iterable[V
 
 
 def _replica_cap(action: ProposedAction, config: PolicyConfig) -> Iterable[Violation]:
-    """Capacity actions may not move replica count by more than the cap."""
+    """Capacity actions may not move replica counts by more than the cap.
+    Covers direct scales AND HPA bound changes — each bound is judged with the
+    same math (the Kyverno twin for bounds is ``cap-hpa-bounds``)."""
     if action.action_type not in (ActionType.SCALE_WORKLOAD, ActionType.RIGHT_SIZE):
         return
-    change = action.replica_change
-    if change is None:
+    changes = [("replica", action.replica_change)]
+    if action.hpa_bounds is not None:
+        changes.append(("HPA minReplicas", action.hpa_bounds.min_replicas))
+        changes.append(("HPA maxReplicas", action.hpa_bounds.max_replicas))
+    for label, change in changes:
+        if change is None:
+            continue
+        if abs(change.pct_change) > config.max_replica_pct_change:
+            pct = (
+                "unbounded" if change.pct_change == float("inf") else f"{change.pct_change:+.0%}"
+            )
+            yield Violation(
+                rule="replica-cap",
+                message=(
+                    f"{label} change {change.current}->{change.desired} ({pct}) exceeds cap "
+                    f"of +/-{config.max_replica_pct_change:.0%}"
+                ),
+            )
+
+
+def _revert_admissible(action: ProposedAction, config: PolicyConfig) -> Iterable[Violation]:
+    """An autonomous capacity change must be revertible under the same cap that
+    admitted it: the inverse change (desired back to current) may not exceed
+    ``max_replica_pct_change``. A -50% downscale (4->2) fits the cap, but its
+    revert (2->4) is +100% — refused here so the deterministic auto-revert can
+    never be blocked by our own guardrails. Judges direct scales AND each HPA
+    bound, exactly like ``_replica_cap``. Engine-only, deliberately without a
+    Kyverno twin: an admission twin would also constrain human operators, who
+    can revert in two steps."""
+    if action.action_type not in (ActionType.SCALE_WORKLOAD, ActionType.RIGHT_SIZE):
         return
-    if abs(change.pct_change) > config.max_replica_pct_change:
-        pct = "unbounded" if change.pct_change == float("inf") else f"{change.pct_change:+.0%}"
-        yield Violation(
-            rule="replica-cap",
-            message=(
-                f"replica change {change.current}->{change.desired} ({pct}) exceeds cap "
-                f"of +/-{config.max_replica_pct_change:.0%}"
-            ),
-        )
+    changes = [("replica", action.replica_change)]
+    if action.hpa_bounds is not None:
+        changes.append(("HPA minReplicas", action.hpa_bounds.min_replicas))
+        changes.append(("HPA maxReplicas", action.hpa_bounds.max_replicas))
+    for label, change in changes:
+        # desired == 0 (scale-to-zero) is already denied by replica-cap: its
+        # revert would be a scale *from* zero, which pct_change treats as
+        # unbounded.
+        if change is None or change.desired <= 0:
+            continue
+        inverse_pct = (change.current - change.desired) / change.desired
+        if abs(inverse_pct) > config.max_replica_pct_change:
+            yield Violation(
+                rule="revert-admissible",
+                message=(
+                    f"{label} change {change.current}->{change.desired} is not "
+                    f"autonomously revertible: the revert "
+                    f"{change.desired}->{change.current} would be {inverse_pct:+.0%}, "
+                    f"over the cap of +/-{config.max_replica_pct_change:.0%}"
+                ),
+            )
 
 
 def _fault_duration_cap(action: ProposedAction, config: PolicyConfig) -> Iterable[Violation]:
@@ -184,6 +226,7 @@ DEFAULT_RULES: tuple[Rule, ...] = (
     _require_ttl,
     _single_experiment,
     _incident_freeze,
+    _revert_admissible,
 )
 
 

@@ -91,6 +91,29 @@ def test_no_state_change_reaches_prod(action_type: ActionType, extra: dict[str, 
     assert "env-scope" in {v.rule for v in decision.violations}
 
 
+def test_admitted_capacity_change_is_always_revertible_under_the_same_caps() -> None:
+    # The capacity analogue of the abort invariant: any replica change the
+    # shipped engine admits, it also admits reversing — the deterministic
+    # auto-revert can never be blocked by our own guardrails.
+    def _capacity(current: int, desired: int) -> ProposedAction:
+        return ProposedAction(
+            action_type=ActionType.SCALE_WORKLOAD,
+            target_id="cluster-a",
+            environment=EnvironmentTier.DEV,
+            namespace="payments",
+            replica_change=ReplicaChange(current=current, desired=desired),
+        )
+
+    for current in range(1, 25):
+        for desired in range(1, 25):
+            if ENGINE.evaluate(_capacity(current, desired)).allowed:
+                revert = ENGINE.evaluate(_capacity(desired, current))
+                assert revert.allowed, (
+                    f"{current}->{desired} was admitted but its revert was denied: "
+                    f"{revert.reason()}"
+                )
+
+
 def test_auto_abort_within_deadline_of_synthetic_breach() -> None:
     # Real engine (shipped config), real gate, real lifecycle + observe loop;
     # only the cluster, metrics, and clock are faked. The steady state holds

@@ -4,9 +4,32 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from chaosagent.domain.enums import ActionType, EnvironmentTier, FaultType, TargetKind
+from chaosagent.domain.targets import _SLUG_RE
+
+
+class WorkloadRef(BaseModel):
+    """The scalable workload a capacity action targets.
+
+    Lives in the domain layer (not chaosagent.capacity) so the executor can
+    import it without a circular execute -> capacity -> execute chain.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["deployment", "statefulset"]
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, value: str) -> str:
+        if not _SLUG_RE.match(value):
+            raise ValueError(
+                f"workload name {value!r} must be a DNS label (lowercase alphanumeric and '-')"
+            )
+        return value
 
 
 class ReplicaChange(BaseModel):
@@ -23,6 +46,19 @@ class ReplicaChange(BaseModel):
         if self.current == 0:
             return float("inf") if self.desired > 0 else 0.0
         return (self.desired - self.current) / self.current
+
+
+class HpaBoundsChange(BaseModel):
+    """A requested change to an HPA's min/max bounds (capacity actions).
+
+    Each bound reuses :class:`ReplicaChange` so the same replica-cap math the
+    engine applies to direct scales applies to both autoscaler bounds.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    min_replicas: ReplicaChange
+    max_replicas: ReplicaChange
 
 
 class NetworkFault(BaseModel):
@@ -184,8 +220,13 @@ class ProposedAction(BaseModel):
     #: Whether that namespace carries the ``chaos-enabled=true`` label. Resolved
     #: from the live cluster by the executor/observer, or supplied in tests.
     namespace_chaos_enabled: bool = False
-    #: Present for capacity actions.
+    #: The workload a capacity action targets. The scale executor refuses any
+    #: write whose target differs from the bound action's workload.
+    workload: WorkloadRef | None = None
+    #: Present for capacity actions that scale a workload directly.
     replica_change: ReplicaChange | None = None
+    #: Present for capacity actions that move an HPA's min/max bounds.
+    hpa_bounds: HpaBoundsChange | None = None
     #: Present for fault injection.
     fault: FaultSpec | None = None
     #: Bounded lifetime for the whole action; None means "no TTL declared".
@@ -200,6 +241,8 @@ class ProposedAction(BaseModel):
         if self.action_type is ActionType.INJECT_FAULT and self.fault is None:
             raise ValueError("inject_fault action requires a fault spec")
         needs_replicas = self.action_type in (ActionType.SCALE_WORKLOAD, ActionType.RIGHT_SIZE)
-        if needs_replicas and self.replica_change is None:
-            raise ValueError(f"{self.action_type.value} action requires a replica_change")
+        if needs_replicas and self.replica_change is None and self.hpa_bounds is None:
+            raise ValueError(
+                f"{self.action_type.value} action requires a replica_change or hpa_bounds"
+            )
         return self

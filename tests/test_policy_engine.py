@@ -164,6 +164,43 @@ def test_incident_freeze_covers_capacity_actions() -> None:
     assert "incident-freeze" in _rules(action)
 
 
+def _capacity(current: int, desired: int) -> ProposedAction:
+    return ProposedAction(
+        action_type=ActionType.SCALE_WORKLOAD,
+        target_id="cluster-a",
+        environment=EnvironmentTier.DEV,
+        namespace="payments",
+        replica_change=ReplicaChange(current=current, desired=desired),
+    )
+
+
+def test_revert_admissible_allows_a_downscale_whose_revert_fits_the_cap() -> None:
+    # 4->3 is -25%; its revert (3->4) is +33% — both inside the 0.5 cap.
+    assert PolicyEngine().evaluate(_capacity(4, 3)).allowed is True
+
+
+def test_revert_admissible_denies_a_downscale_with_an_inadmissible_revert() -> None:
+    # 4->2 is -50% (inside the cap), but its revert (2->4) would be +100%.
+    rules = _rules(_capacity(4, 2))
+    assert "replica-cap" not in rules
+    assert "revert-admissible" in rules
+
+
+def test_upscales_within_cap_are_always_revertible() -> None:
+    # An in-cap upscale's inverse is a smaller fractional change, so the rule
+    # can never deny an upscale the replica cap admits.
+    for current in range(1, 30):
+        desired = current + (current // 2)  # the largest in-cap upscale
+        assert PolicyEngine().evaluate(_capacity(current, desired)).allowed is True
+
+
+def test_revert_admissible_is_deterministic() -> None:
+    engine = PolicyEngine()
+    first = engine.evaluate(_capacity(4, 2))
+    for _ in range(20):
+        assert engine.evaluate(_capacity(4, 2)) == first
+
+
 def test_namespace_scope_denies_out_of_scope() -> None:
     action = _inject(
         namespace="boutique",
