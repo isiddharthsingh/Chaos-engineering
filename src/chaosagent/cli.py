@@ -1,7 +1,10 @@
 """CLI: register/list targets, pre-flight policy checks, and autonomous runs.
 
 `register`/`list`/`check` exercise the guardrail spine without a cluster;
-`run` drives one experiment end to end (spec file or LLM intent) on the rig.
+`run` drives one experiment end to end (spec file or LLM intent) on the rig;
+`recommend` prints a bounded, read-only capacity recommendation; `scale`
+drives one replica change through the capacity lifecycle (verify or
+auto-revert).
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ import json
 import sys
 from pathlib import Path
 
+from chaosagent.capacity.runner import CapacitySettings, run_recommend, run_scale
 from chaosagent.config import load_policy_config
 from chaosagent.domain.actions import ProposedAction
 from chaosagent.domain.enums import EnvironmentTier
@@ -96,6 +100,39 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     return run_suite_command(settings)
 
 
+def _cmd_recommend(args: argparse.Namespace) -> int:
+    settings = CapacitySettings(
+        target_id=args.target,
+        store=args.store,
+        namespace=args.namespace,
+        workload=args.workload,
+        target_utilization=args.target_utilization,
+        lookback_minutes=args.lookback,
+        prometheus_url=args.prom_url,
+        opencost_url=args.opencost_url,
+        kubeconfig=args.kubeconfig,
+        context=args.context,
+        output=args.output,
+        policy=args.policy,
+    )
+    return run_recommend(settings)
+
+
+def _cmd_scale(args: argparse.Namespace) -> int:
+    settings = CapacitySettings(
+        target_id=args.target,
+        store=args.store,
+        spec_file=args.spec,
+        prometheus_url=args.prom_url,
+        kubeconfig=args.kubeconfig,
+        context=args.context,
+        dry_run=args.dry_run,
+        output=args.output,
+        policy=args.policy,
+    )
+    return run_scale(settings)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chaosagent", description=__doc__)
     parser.add_argument("--store", type=Path, default=_DEFAULT_STORE, help="target store path")
@@ -156,6 +193,55 @@ def build_parser() -> argparse.ArgumentParser:
     suite.add_argument("--output", type=Path, help="write the aggregate report JSON here")
     suite.add_argument("--policy", type=Path, default=None, help="policy config YAML")
     suite.set_defaults(func=_cmd_suite)
+
+    rec = sub.add_parser(
+        "recommend",
+        help="recommend a bounded replica change from utilization signals (read-only)",
+    )
+    rec.add_argument("--target", required=True, help="registered target id")
+    rec.add_argument("--namespace", required=True, help="namespace of the workload")
+    rec.add_argument(
+        "--workload", required=True, help="deployment/<name> or statefulset/<name>"
+    )
+    rec.add_argument(
+        "--target-utilization",
+        type=float,
+        default=0.6,
+        help="utilization the sizing aims for (default: 0.6)",
+    )
+    rec.add_argument(
+        "--lookback", type=int, default=60, help="signal lookback window in minutes"
+    )
+    rec.add_argument("--prom-url", help="Prometheus base URL (or CHAOSAGENT_PROMETHEUS_URL)")
+    rec.add_argument(
+        "--opencost-url",
+        help="OpenCost base URL (or CHAOSAGENT_OPENCOST_URL); enables the cost signal",
+    )
+    rec.add_argument("--kubeconfig", help="kubeconfig path for the VPA signal read")
+    rec.add_argument("--context", help="kubeconfig context for the VPA signal read")
+    rec.add_argument("--output", type=Path, help="write the recommendation JSON here")
+    rec.add_argument("--policy", type=Path, default=None, help="policy config YAML")
+    rec.set_defaults(func=_cmd_recommend)
+
+    scale = sub.add_parser(
+        "scale",
+        help="apply one bounded replica change (baseline -> apply -> verify or auto-revert)",
+    )
+    scale.add_argument("--target", required=True, help="registered target id")
+    scale.add_argument(
+        "--spec", type=Path, required=True, help="path to a CapacitySpec JSON document"
+    )
+    scale.add_argument("--prom-url", help="Prometheus base URL (or CHAOSAGENT_PROMETHEUS_URL)")
+    scale.add_argument("--kubeconfig", help="kubeconfig path (default: standard discovery)")
+    scale.add_argument("--context", help="kubeconfig context")
+    scale.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="stop after pre-flight (engine + server-side dry-run); change nothing",
+    )
+    scale.add_argument("--output", type=Path, help="write the report JSON here")
+    scale.add_argument("--policy", type=Path, default=None, help="policy config YAML")
+    scale.set_defaults(func=_cmd_scale)
 
     return parser
 

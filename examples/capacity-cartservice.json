@@ -1,0 +1,19 @@
+{
+  "title": "right-size cartservice to observed load",
+  "target_id": "kind-local",
+  "namespace": "boutique",
+  "workload": {"kind": "deployment", "name": "cartservice"},
+  "desired_replicas": 3,
+  "hypotheses": [
+    {
+      "name": "cartservice-replicas-available",
+      "query": "kube_deployment_status_replicas_available{namespace=\"boutique\",deployment=\"cartservice\"}",
+      "comparator": ">=",
+      "threshold": 1
+    }
+  ],
+  "ttl_seconds": 600,
+  "observe_interval_seconds": 5.0,
+  "baseline_seconds": 30,
+  "settle_seconds": 120
+}
